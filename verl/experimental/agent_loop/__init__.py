@@ -22,9 +22,10 @@ from .agent_loop import (
 )
 from .diffusion_agent_loop import DiffusionAgentLoopWorker
 from .single_turn_agent_loop import SingleTurnAgentLoop
+from .tasksync_agent_loop import TaskSyncAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, TaskSyncAgentLoop, ToolAgentLoop]
 
 __all__ = [
     "AgentLoopBase",
