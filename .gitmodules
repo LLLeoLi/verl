@@ -1,3 +1,6 @@
 [submodule "recipe"]
 	path = recipe
 	url = https://github.com/verl-project/verl-recipe.git
+[submodule "task-sync"]
+	path = task-sync
+	url = https://github.com/LLLeoLi/task-sync.git
