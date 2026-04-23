@@ -26,14 +26,14 @@ sudo python3 -m pip install protobuf==4.25.3 --break-system-packages
 
 git submodule update --init task-sync
 
-hdfs dfs -get hdfs://harunava/home/byte_malia_gcp_aiic/user/codeai/hf_models/Qwen3.5-35B-A3B /opt/tiger/entry/Qwen3.5-35B-A3B
-echo "Downloaded Qwen3.5-35B-A3B"
+hdfs dfs -get hdfs://harunava/home/byte_malia_gcp_aiic/user/codeai/hf_models/Qwen3-Coder-30B-A3B-Instruct /opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct
+echo "Downloaded Qwen3-Coder-30B-A3B-Instruct"
 
 if [ "${1:-}" = "--mcore" ]; then
-    echo "Converting Qwen3.5-35B-A3B to mcore format"
+    echo "Converting Qwen3-Coder-30B-A3B-Instruct to mcore format"
     python scripts/converter_hf_to_mcore.py \
-        --hf_model_path /opt/tiger/entry/Qwen3.5-35B-A3B \
-        --output_path /opt/tiger/entry/Qwen3.5-35B-A3B-mcore \
+        --hf_model_path /opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct \
+        --output_path /opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct-mcore \
         --trust_remote_code
-    echo "Converted Qwen3.5-35B-A3B to mcore format"
+    echo "Converted Qwen3-Coder-30B-A3B-Instruct to mcore format"
 fi
