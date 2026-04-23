@@ -2,8 +2,6 @@
 set -euxo pipefail
 sudo python3 -m pip install --no-deps -e . --break-system-packages
 sudo python3 -m pip uninstall bytedray -y --break-system-packages && sudo python3 -m pip install "ray[default]" --no-deps --break-system-packages
-sudo python3 -m pip uninstall byted-wandb -y --break-system-packages && sudo python3 -m pip install wandb==0.23.1 --break-system-packages
-sudo python3 -m pip install protobuf==4.25.3 --break-system-packages
 sudo python3 -m pip install sandbox_fusion --break-system-packages
 sudo python3 -m pip install logfire --break-system-packages
 sudo python3 -m pip install --upgrade huggingface_hub --break-system-packages
@@ -18,6 +16,10 @@ sudo python3 -m pip install "fastapi[all]" uvicorn --break-system-packages
 sudo python3 -m pip install aiohttp --break-system-packages
 sudo python3 -m pip install --upgrade jupyter_client ipykernel --break-system-packages
 sudo python3 -m pip install faker --break-system-packages
+
+# Install wandb and protobuf last to avoid being overridden by other packages' deps
+sudo python3 -m pip uninstall byted-wandb -y --break-system-packages && sudo python3 -m pip install wandb==0.23.1 --break-system-packages
+sudo python3 -m pip install protobuf==4.25.3 --break-system-packages
 
 git submodule update --init task-sync
 
