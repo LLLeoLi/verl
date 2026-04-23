@@ -736,3 +736,104 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         """
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
+
+    # ==================== SM Warmup (rollout phase only) ====================
+    #
+    # Keep GPU SMs active while vLLM inference is running so that the device
+    # clock does not downscale during rollout. The trainer calls start_sm_warmup
+    # right before generate_sequences and stop_sm_warmup right after; the
+    # warmup runs on a low-priority CUDA stream so vLLM / NCCL kernels preempt it
+    # at the SM scheduler level.
+    #
+    # This intentionally does NOT hook into PCIe weight load/offload (that is a
+    # separate "sm_warmup_transfer" feature in sync_verl and is not ported here).
+
+    def _start_sm_warmup_thread(self):
+        """Start a background matmul thread on a low-priority CUDA stream.
+
+        Returns (stop_event, thread) so callers can manage the lifecycle.
+        """
+        import threading
+
+        from verl.utils.device import get_torch_device
+
+        stop_event = threading.Event()
+        device = get_torch_device().current_device()
+
+        def _warmup_loop():
+            stream = torch.cuda.Stream(device=device, priority=0)
+            mm_size = 4096
+            elem_size = 2048
+            try:
+                with torch.cuda.stream(stream):
+                    a = torch.randn(mm_size, mm_size, dtype=torch.float16, device=device)
+                    b = torch.randn(mm_size, mm_size, dtype=torch.float16, device=device)
+                    mm_out = torch.empty(mm_size, mm_size, dtype=torch.float16, device=device)
+                    c = torch.randn(elem_size, elem_size, dtype=torch.float32, device=device)
+
+                    while not stop_event.is_set():
+                        for _ in range(5):
+                            if stop_event.is_set():
+                                break
+                            torch.mm(a, b, out=mm_out)
+                            c.mul_(1.0001).add_(0.0001)
+                            c.tanh_()
+                            c.mul_(0.9).add_(0.1)
+                            c.sin_()
+                        # Back-pressure: poll stream.query() (non-blocking) instead of
+                        # stream.synchronize() (can block on GPU contention). Bounds
+                        # CUDA command queue length and keeps stop_event latency ~1ms.
+                        while not stream.query() and not stop_event.is_set():
+                            stop_event.wait(timeout=0.001)
+
+                    # Drain pending ops before freeing tensors to avoid racing
+                    # del with in-flight kernels.
+                    stream.synchronize()
+                    del a, b, mm_out, c
+            except Exception as e:
+                logger.warning(f"SM warmup thread error: {e}")
+
+        thread = threading.Thread(target=_warmup_loop, daemon=True)
+        thread.start()
+        return stop_event, thread
+
+    @staticmethod
+    def _stop_sm_warmup_thread(stop_event, thread, timeout: int = 30):
+        """Signal a warmup thread to stop and wait for it to exit."""
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.warning(f"SM warmup thread did not exit within {timeout}s")
+
+    def _drain_sm_warmup(self):
+        """Stop any previously-started warmup thread. Safe if none was started."""
+        stop_event = getattr(self, "_sm_warmup_stop", None)
+        thread = getattr(self, "_sm_warmup_thread", None)
+        self._stop_sm_warmup_thread(stop_event, thread)
+        self._sm_warmup_stop = None
+        self._sm_warmup_thread = None
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def start_sm_warmup(self):
+        """Start background SM warmup thread on every worker.
+
+        Called by the trainer before generate_sequences. Runs concurrently with
+        vLLM inference; same CUDA context → true SM concurrency, no MPS needed.
+
+        Thread safety: start/stop are issued from the Ray driver's single-threaded
+        dispatch path (ONE_TO_ALL), so they are never concurrent with each other.
+        """
+        self._drain_sm_warmup()
+        stop_event, thread = self._start_sm_warmup_thread()
+        self._sm_warmup_stop = stop_event
+        self._sm_warmup_thread = thread
+        logger.info("SM warmup background thread started")
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def stop_sm_warmup(self):
+        """Stop the background SM warmup thread started by start_sm_warmup."""
+        self._drain_sm_warmup()
+        aggressive_empty_cache()
+        logger.info("SM warmup background thread stopped")

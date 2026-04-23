@@ -405,16 +405,26 @@ class TaskSyncTrainer(RayPPOTrainer):
                     else:
                         self._effective_reward_type = None
 
-                    with marked_timer("gen", timing_raw, color="red"):
-                        gen_batch_output = self._run_rollout(
-                            dataset=self.planning_dataset,
-                            batch_index=batch_idx,
-                            validate=False,
-                        )
-                        # Sleep rollout replicas so trainer forward/backward gets the GPUs.
-                        self.checkpoint_manager.sleep_replicas()
-                        timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
-                        gen_batch_output.meta_info.pop("timing", None)
+                    # SM warmup runs on every worker's GPU on a low-priority CUDA
+                    # stream, concurrent with vLLM inference. Prevents clock
+                    # downscaling during rollout. Enabled via trainer.sm_warmup=True.
+                    sm_warmup_enabled = self.config.trainer.get("sm_warmup", False)
+                    if sm_warmup_enabled:
+                        self.actor_rollout_wg.start_sm_warmup()
+                    try:
+                        with marked_timer("gen", timing_raw, color="red"):
+                            gen_batch_output = self._run_rollout(
+                                dataset=self.planning_dataset,
+                                batch_index=batch_idx,
+                                validate=False,
+                            )
+                            # Sleep rollout replicas so trainer forward/backward gets the GPUs.
+                            self.checkpoint_manager.sleep_replicas()
+                            timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
+                            gen_batch_output.meta_info.pop("timing", None)
+                    finally:
+                        if sm_warmup_enabled:
+                            self.actor_rollout_wg.stop_sm_warmup()
 
                     if gen_batch_output.batch is None or "input_ids" not in gen_batch_output.batch:
                         logger.warning(

@@ -63,6 +63,7 @@ while [[ "$#" -gt 0 ]]; do
         --val_ratio) val_ratio="$2"; shift 2 ;;
         --test_freq) test_freq="$2"; shift 2 ;;
         --suffix) suffix="$2"; shift 2 ;;
+        --sm_warmup) sm_warmup="$2"; shift 2 ;;
         *) break ;;
     esac
 done
@@ -139,6 +140,7 @@ enable_ptc=${enable_ptc:-True}
 dense_epoch=${dense_epoch:-0}
 val_ratio=${val_ratio:-0.0}
 test_freq=${test_freq:--1}
+sm_warmup=${sm_warmup:-False}
 
 # ==============================================================================
 # Experiment name
@@ -257,6 +259,7 @@ TRAIN_CMD=(
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}
     trainer.dense_epoch=${dense_epoch}
+    +trainer.sm_warmup=${sm_warmup}
     trainer.resume_mode=auto
     trainer.default_local_dir=${ckpt_root}
 
