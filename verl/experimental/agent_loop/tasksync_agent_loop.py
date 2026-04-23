@@ -830,6 +830,11 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
                 tool_calls=agent_data.metrics.get("tool_calls", 0.0),
                 num_preempted=agent_data.metrics.get("num_preempted", -1),
             ),
+            # task-sync computes its reward inside env.step(); surface it here so
+            # the agent_loop `_compute_score` path short-circuits and does not
+            # invoke the generic reward_loop worker (which expects `data_source`
+            # in non_tensor_batch -- task-sync never populates that field).
+            reward_score=float(agent_data.final_reward),
             extra_fields={},
         )
 
@@ -863,6 +868,9 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             multi_modal_data={},
             num_turns=0,
             metrics=AgentLoopMetrics(),
+            # See note in build_output: task-sync must surface reward_score to
+            # short-circuit the generic reward_loop worker.
+            reward_score=0.0,
             extra_fields={
                 "reward_extra_info": {
                     "episode_reward": 0.0,
