@@ -584,15 +584,20 @@ class TaskSyncTrainer(RayPPOTrainer):
 
                     # Compute old log probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        # Megatron forward_step reads `batch["temperature"]` unconditionally
-                        # (workers/engine/megatron/transformer_impl.py:823). The base
-                        # RayPPOTrainer.fit() sets this on every iteration's batch; our
-                        # override skips that path, and the filter_groups branch above
-                        # wipes meta_info to {}. Re-populate before the log-prob call so
-                        # compute_log_prob doesn't KeyError on 'temperature'.
+                        # The base RayPPOTrainer.fit() sets both of these on every
+                        # iteration's batch BEFORE old_log_prob; our override doesn't,
+                        # and the filter_groups branch above wipes meta_info to {}.
+                        # - temperature: read unconditionally in Megatron forward_step
+                        #   (workers/engine/megatron/transformer_impl.py:823).
+                        # - global_token_num: engine_workers._postprocess_output only
+                        #   writes the `mfu` metric when this is set; _compute_old_log_prob
+                        #   then does `tu.get(output, "metrics")["mfu"]` (ray_trainer:1177).
                         batch.meta_info["temperature"] = (
                             self.config.actor_rollout_ref.rollout.temperature
                         )
+                        batch.meta_info["global_token_num"] = torch.sum(
+                            batch.batch["attention_mask"], dim=-1
+                        ).tolist()
                         old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                         if "entropys" in old_log_prob.batch:
                             from verl.trainer.ppo.core_algos import agg_loss
