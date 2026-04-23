@@ -17,6 +17,14 @@ sudo python3 -m pip install aiohttp --break-system-packages
 sudo python3 -m pip install --upgrade jupyter_client ipykernel --break-system-packages
 sudo python3 -m pip install faker --break-system-packages
 
+# Deps required by task-sync + mbridge HF loading path:
+#   mcore-bridge          - needed when train_megatron.sh uses mbridge to load HF weights directly
+#   flash-linear-attention - required by Qwen3.5 Gated Delta Net linear attention
+#   tilelang              - used by task-sync kernels
+sudo python3 -m pip install 'mcore-bridge>=1.0.2' -U --break-system-packages
+sudo python3 -m pip install flash-linear-attention --break-system-packages
+sudo python3 -m pip install tilelang --break-system-packages
+
 # Install wandb and protobuf last to avoid being overridden by other packages' deps
 # Note: also purge the user-local byted-wandb at ~/.local, otherwise it shadows
 # the system wandb and re-introduces the databus/protobuf pb2 import error.
@@ -29,6 +37,11 @@ git submodule update --init task-sync
 hdfs dfs -get hdfs://harunava/home/byte_malia_gcp_aiic/user/codeai/hf_models/Qwen3-Coder-30B-A3B-Instruct /opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct
 echo "Downloaded Qwen3-Coder-30B-A3B-Instruct"
 
+# NOTE: offline HF -> mcore conversion is no longer required. train_megatron.sh
+# now defaults to use_dist_checkpointing=False, which lets mbridge load the HF
+# weights directly at startup. Pass `--mcore` only if you explicitly want the
+# legacy dist-checkpoint path (and must also run with
+# --use_dist_checkpointing True).
 if [ "${1:-}" = "--mcore" ]; then
     echo "Converting Qwen3-Coder-30B-A3B-Instruct to mcore format"
     python scripts/converter_hf_to_mcore.py \

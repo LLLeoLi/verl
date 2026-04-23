@@ -27,6 +27,7 @@ while [[ "$#" -gt 0 ]]; do
         --exp_name) exp_name="$2"; shift 2 ;;
         --model_path) model_path="$2"; shift 2 ;;
         --dist_ckpt_path) dist_ckpt_path="$2"; shift 2 ;;
+        --use_dist_checkpointing) use_dist_checkpointing="$2"; shift 2 ;;
         --data_dir) data_dir="$2"; shift 2 ;;
         --ckpt_root) ckpt_root="$2"; shift 2 ;;
         --prompt_len) prompt_len="$2"; shift 2 ;;
@@ -70,7 +71,13 @@ done
 # Model / data paths
 # ==============================================================================
 model_path=${model_path:-/opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct}
-dist_ckpt_path=${dist_ckpt_path:-/opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct-mcore}
+# Loader mode:
+#   use_dist_checkpointing=False (default) -> mbridge loads weights directly from
+#     model_path (HF format) at startup; no offline mcore conversion needed.
+#   use_dist_checkpointing=True            -> load a pre-converted mcore dist
+#     checkpoint from dist_ckpt_path (legacy path, requires setup.sh --mcore).
+use_dist_checkpointing=${use_dist_checkpointing:-False}
+dist_ckpt_path=${dist_ckpt_path:-null}
 # Resolved against REPO_ROOT since we cd'd there above.
 data_dir=${data_dir:-task-sync/claude-sync-v4/opus}
 
@@ -203,7 +210,7 @@ TRAIN_CMD=(
 
     # actor megatron parallelism
     actor_rollout_ref.actor.megatron.use_mbridge=${use_mbridge}
-    actor_rollout_ref.actor.megatron.use_dist_checkpointing=True
+    actor_rollout_ref.actor.megatron.use_dist_checkpointing=${use_dist_checkpointing}
     actor_rollout_ref.actor.megatron.dist_checkpointing_path=${dist_ckpt_path}
     actor_rollout_ref.actor.megatron.param_offload=${offload}
     actor_rollout_ref.actor.megatron.grad_offload=${offload}
