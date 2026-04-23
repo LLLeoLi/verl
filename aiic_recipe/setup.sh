@@ -2,7 +2,8 @@
 set -euxo pipefail
 sudo python3 -m pip install --no-deps -e . --break-system-packages
 sudo python3 -m pip uninstall bytedray -y --break-system-packages && sudo python3 -m pip install "ray[default]" --no-deps --break-system-packages
-sudo python3 -m pip uninstall byted-wandb -y --break-system-packages && sudo python3 -m pip install wandb --break-system-packages
+sudo python3 -m pip uninstall byted-wandb -y --break-system-packages && sudo python3 -m pip install wandb==0.23.1 --break-system-packages
+sudo python3 -m pip install protobuf==4.25.3 --break-system-packages
 sudo python3 -m pip install sandbox_fusion --break-system-packages
 sudo python3 -m pip install logfire --break-system-packages
 sudo python3 -m pip install --upgrade huggingface_hub --break-system-packages
