@@ -44,7 +44,12 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.single_controller.ray import RayWorkerGroup
-from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_timing_metrics
+from verl.trainer.ppo.metric_utils import (
+    compute_data_metrics,
+    compute_throughout_metrics,
+    compute_timing_metrics,
+    compute_variance_proxy_metrics,
+)
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     ResourcePoolManager,
@@ -435,6 +440,13 @@ class TaskSyncTrainer(RayPPOTrainer):
                     if "response_mask" not in new_batch.batch.keys():
                         new_batch.batch["response_mask"] = compute_response_mask(new_batch)
 
+                    # Balance valid tokens across DP ranks so dynamic_bsz + MoE packing
+                    # doesn't leave one rank starved / another OOM. Mirrors RayPPOTrainer.fit
+                    # (ray_trainer.py:1397-1398). Changes row order -- safe because advantage
+                    # computation groups by uid, not by position.
+                    if self.config.trainer.get("balance_batch", True):
+                        self._balance_batch(new_batch, metrics=metrics)
+
                     if "reward" not in new_batch.non_tensor_batch:
                         if "episode_reward" in new_batch.non_tensor_batch:
                             new_batch.non_tensor_batch["reward"] = (
@@ -572,6 +584,15 @@ class TaskSyncTrainer(RayPPOTrainer):
 
                     # Compute old log probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        # Megatron forward_step reads `batch["temperature"]` unconditionally
+                        # (workers/engine/megatron/transformer_impl.py:823). The base
+                        # RayPPOTrainer.fit() sets this on every iteration's batch; our
+                        # override skips that path, and the filter_groups branch above
+                        # wipes meta_info to {}. Re-populate before the log-prob call so
+                        # compute_log_prob doesn't KeyError on 'temperature'.
+                        batch.meta_info["temperature"] = (
+                            self.config.actor_rollout_ref.rollout.temperature
+                        )
                         old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                         if "entropys" in old_log_prob.batch:
                             from verl.trainer.ppo.core_algos import agg_loss
@@ -591,6 +612,18 @@ class TaskSyncTrainer(RayPPOTrainer):
                             })
                             old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
+
+                        assert "old_log_probs" in batch.batch, (
+                            f'"old_log_probs" not in {list(batch.batch.keys())=}'
+                        )
+
+                        # Surface π_rollout vs π_old drift metrics (KL/PPL/pearson).
+                        # Critical in async rollout mode where rollout weights lag
+                        # behind the actor. Mirrors ray_trainer.py:1459-1463.
+                        if "rollout_log_probs" in batch.batch.keys():
+                            from verl.utils.debug.metrics import calculate_debug_metrics
+
+                            metrics.update(calculate_debug_metrics(batch))
 
                     if self.use_reference_policy:
                         with marked_timer("ref", timing_raw, color="yellow"):
@@ -661,6 +694,16 @@ class TaskSyncTrainer(RayPPOTrainer):
                 metrics.update(gen_batch_output.meta_info.get("planning_stats", {}))
                 metrics.update(compute_timing_metrics(batch, timing_raw))
                 metrics.update(compute_data_metrics(batch, use_critic=self.use_critic))
+                # perf/samples_per_sec, perf/tokens_per_sec, etc.
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(
+                    compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus)
+                )
+                # advantage/reward variance vs. grad norm -- health signal for GSPO/GRPO.
+                gradient_norm = metrics.get("actor/grad_norm", None)
+                metrics.update(
+                    compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm)
+                )
                 metrics["train/num_gen_batches"] = num_gen_batches
                 metrics["training/global_step"] = self.global_steps
                 metrics["training/epoch"] = epoch
