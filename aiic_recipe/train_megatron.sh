@@ -69,8 +69,8 @@ done
 # ==============================================================================
 # Model / data paths
 # ==============================================================================
-model_path=${model_path:-/opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct}
-dist_ckpt_path=${dist_ckpt_path:-/opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct-mcore}
+model_path=${model_path:-/opt/tiger/entry/Qwen3.5-35B-A3B}
+dist_ckpt_path=${dist_ckpt_path:-/opt/tiger/entry/Qwen3.5-35B-A3B-mcore}
 # Resolved against REPO_ROOT since we cd'd there above.
 data_dir=${data_dir:-task-sync/claude-sync-v4/opus}
 
