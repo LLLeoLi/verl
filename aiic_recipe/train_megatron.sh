@@ -121,7 +121,7 @@ max_token_len_per_gpu=${max_token_len_per_gpu:-$(( (total_len + actor_cp - 1) / 
 # ==============================================================================
 offload=${offload:-True}
 offload_fraction=${offload_fraction:-1.0}
-use_mbridge=${use_mbridge:-False}
+use_mbridge=${use_mbridge:-True}
 gpu_memory_utilization=${gpu_memory_utilization:-0.6}
 num_workers=${num_workers:-8}
 save_freq=${save_freq:-50}
