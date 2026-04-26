@@ -17,6 +17,7 @@ Isolation strategy (layered):
 import ctypes
 import os
 import re
+import resource
 import shutil
 import signal
 import subprocess
@@ -25,6 +26,11 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+# Default per-kernel address-space cap (bytes). Override via the
+# `mem_limit_bytes` kwarg to StatefulSandbox or the
+# VERL_SANDBOX_MEM_LIMIT_BYTES env var. 0 disables the cap.
+_DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_SANDBOX_MEM_LIMIT_BYTES", str(8 * 1024**3)))
 
 _KERNEL_START_LOCK = threading.Lock()
 
@@ -266,14 +272,25 @@ class StatefulSandbox:
             print(sb.execute("print(x)"))  # prints 42
     """
 
-    def __init__(self, workspace_path: str, timeout: float = 30.0):
+    def __init__(
+        self,
+        workspace_path: str,
+        timeout: float = 10.0,
+        mem_limit_bytes: int | None = None,
+        interrupt_grace_seconds: float = 2.0,
+    ):
         self.workspace_path = workspace_path
         self.timeout = timeout
+        self.mem_limit_bytes = (
+            mem_limit_bytes if mem_limit_bytes is not None else _DEFAULT_MEM_LIMIT_BYTES
+        )
+        self.interrupt_grace_seconds = interrupt_grace_seconds
         self._tmpdir: str | None = None
         self._proc: subprocess.Popen | None = None
         self._client = None
         self._conn_file: Path | None = None
         self._cleaned_up = False
+        self._dead = False
         self._landlock_active = False
 
     def start(self):
@@ -305,8 +322,17 @@ class StatefulSandbox:
 
         abi = _landlock_abi_version()
         landlock_ok = abi >= 1
+        mem_limit = self.mem_limit_bytes
 
         def _preexec():
+            # Cap address space so a single misbehaving kernel cannot OOM the
+            # node. Soft+hard set to the same value; hitting it raises
+            # MemoryError inside the kernel rather than killing the host.
+            if mem_limit and mem_limit > 0:
+                try:
+                    resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
+                except (ValueError, OSError):
+                    pass
             if landlock_ok:
                 _apply_landlock(writable)
 
@@ -397,9 +423,60 @@ class StatefulSandbox:
         else:
             print("[sandbox] WARNING: Landlock unavailable -- Python open() guard only.")
 
+    def _try_interrupt_to_idle(self, msg_id: str, grace_seconds: float) -> bool:
+        """Send SIGINT to the kernel and wait up to grace_seconds for the
+        in-flight execution (msg_id) to reach an idle status. Returns True if
+        the kernel recovered, False otherwise. State (variables/imports) is
+        preserved on a successful interrupt."""
+        if self._proc is None or self._proc.poll() is not None:
+            return False
+        try:
+            os.killpg(self._proc.pid, signal.SIGINT)
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+        deadline = time.time() + grace_seconds
+        client = self._client
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            try:
+                msg = client.get_iopub_msg(timeout=remaining)
+            except Exception:
+                return False
+            if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                continue
+            msg_type = msg.get("header", {}).get("msg_type", "")
+            content = msg.get("content", {})
+            if msg_type == "status" and content.get("execution_state") == "idle":
+                return True
+
+    def _kill_kernel_now(self):
+        """Hard-kill the kernel process group and mark sandbox dead."""
+        self._dead = True
+        proc = self._proc
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                os.kill(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
     def _run(self, code: str) -> tuple[str, str, bool]:
         """Execute code in the kernel and return (stdout, stderr, success)."""
+        if self._dead:
+            raise RuntimeError("Kernel was killed after a previous timeout")
         if self._proc is not None and self._proc.poll() is not None:
+            self._dead = True
             raise RuntimeError(
                 f"Kernel process has exited unexpectedly (code {self._proc.returncode})"
             )
@@ -414,10 +491,19 @@ class StatefulSandbox:
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
+                # Try to interrupt cleanly so kernel state survives; otherwise
+                # SIGKILL the kernel so subsequent execute() calls don't block
+                # for another full timeout each.
+                recovered = self._try_interrupt_to_idle(msg_id, self.interrupt_grace_seconds)
+                if not recovered:
+                    self._kill_kernel_now()
                 raise TimeoutError("Kernel execution timed out")
             try:
                 msg = client.get_iopub_msg(timeout=remaining)
             except Exception:
+                recovered = self._try_interrupt_to_idle(msg_id, self.interrupt_grace_seconds)
+                if not recovered:
+                    self._kill_kernel_now()
                 raise TimeoutError("Kernel execution timed out")
 
             if msg.get("parent_header", {}).get("msg_id") != msg_id:
@@ -455,6 +541,11 @@ class StatefulSandbox:
         """
         if self._client is None:
             return "[Error] Sandbox not started. Call start() first."
+        if self._dead:
+            return (
+                "[Error] Sandbox is no longer available "
+                "(killed after a previous timeout / crash). Subsequent code will not run."
+            )
         try:
             output, error, success = self._run(code)
             result = output
@@ -462,7 +553,12 @@ class StatefulSandbox:
                 result += ("\n[stderr]:\n" if result else "") + error.strip()
             return result.strip() if result.strip() else "(no output)"
         except TimeoutError:
-            return f"[Error] Code execution timed out ({self.timeout}-second limit)."
+            suffix = (
+                " Sandbox killed; subsequent code will not run."
+                if self._dead
+                else " Sandbox interrupted; state preserved."
+            )
+            return f"[Error] Code execution timed out ({self.timeout}-second limit).{suffix}"
         except Exception as e:
             return f"[Error] {e}"
 
@@ -471,6 +567,7 @@ class StatefulSandbox:
         if self._cleaned_up:
             return
         self._cleaned_up = True
+        self._dead = True
 
         proc = self._proc
         self._proc = None

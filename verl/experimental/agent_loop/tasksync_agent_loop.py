@@ -376,7 +376,7 @@ class TaskSyncAgentLoop(AgentLoopBase):
 
             env_dir = env.env_dir
 
-            sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=30.0)
+            sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
             try:
                 sandbox.start()
             except Exception as e:
@@ -385,7 +385,7 @@ class TaskSyncAgentLoop(AgentLoopBase):
                 return self._build_early_termination_output(request_id, metrics)
 
             if self.enable_ptc:
-                ptc_sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=30.0)
+                ptc_sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
                 try:
                     ptc_sandbox.start()
                 except Exception as e:
