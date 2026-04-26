@@ -324,7 +324,18 @@ class TaskSyncAgentLoop(AgentLoopBase):
         self.max_tool_calls = env_cfg.get("max_tool_calls", 50)
         self.ptc_timeout = env_cfg.get("ptc_timeout", 5.0)
         self.data_py_timeout = env_cfg.get("data_py_timeout", 120)
-        self.enable_ptc = env_cfg.get("enable_ptc", True)
+
+        # ptc_mode controls whether the programmatic_tool_call tool is exposed.
+        #   "ptc"     -> every rollout has PTC
+        #   "no-ptc"  -> no rollout has PTC
+        #   "mixed"   -> trainer assigns per-group: half of groups have PTC, half don't.
+        #                Per-sample enable_ptc is passed in via raw_prompt; the value
+        #                read here is only used as a fallback.
+        self.ptc_mode = env_cfg.get("ptc_mode", "ptc")
+        assert self.ptc_mode in ("ptc", "no-ptc", "mixed"), (
+            f"ptc_mode must be 'ptc', 'no-ptc', or 'mixed', got '{self.ptc_mode}'"
+        )
+        self.enable_ptc_default = self.ptc_mode != "no-ptc"
 
         self.reward_type = env_cfg.get("reward_type", "dense")
         assert self.reward_type in ("dense", "binary"), (
@@ -355,9 +366,11 @@ class TaskSyncAgentLoop(AgentLoopBase):
         if isinstance(raw_prompt, dict) and "task_info" in raw_prompt:
             task_info = raw_prompt["task_info"]
             max_tool_calls = raw_prompt.get("max_tool_calls", self.max_tool_calls)
+            enable_ptc = bool(raw_prompt.get("enable_ptc", self.enable_ptc_default))
         elif "task_info" in extra_info:
             task_info = extra_info["task_info"]
             max_tool_calls = extra_info.get("max_tool_calls", self.max_tool_calls)
+            enable_ptc = bool(extra_info.get("enable_ptc", self.enable_ptc_default))
         else:
             raise ValueError("task_info not found in raw_prompt or extra_info")
 
@@ -368,7 +381,7 @@ class TaskSyncAgentLoop(AgentLoopBase):
         agent_data: Optional[TaskSyncAgentData] = None
         try:
             try:
-                env = self._create_env_from_task_info(task_info)
+                env = self._create_env_from_task_info(task_info, enable_ptc=enable_ptc)
             except Exception as e:
                 logger.error(f"Failed to create env for task {task_info.get('task_name', '?')}: {e}")
                 metrics["env_creation_error"] = str(e)
@@ -384,7 +397,7 @@ class TaskSyncAgentLoop(AgentLoopBase):
                 metrics["sandbox_start_error"] = str(e)
                 return self._build_early_termination_output(request_id, metrics)
 
-            if self.enable_ptc:
+            if enable_ptc:
                 ptc_sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
                 try:
                     ptc_sandbox.start()
@@ -458,7 +471,9 @@ class TaskSyncAgentLoop(AgentLoopBase):
         assert agent_data is not None  # for mypy
         return self._build_output(agent_data)
 
-    def _create_env_from_task_info(self, task_info: dict[str, Any]) -> TaskSyncEnvState:
+    def _create_env_from_task_info(
+        self, task_info: dict[str, Any], enable_ptc: bool
+    ) -> TaskSyncEnvState:
         source_path = task_info["source_path"]
         task_name = task_info.get("task_name", os.path.basename(source_path))
 
@@ -508,7 +523,7 @@ class TaskSyncAgentLoop(AgentLoopBase):
             env_file=env_file,
             task_name=task_name,
             max_tool_calls=self.max_tool_calls,
-            enable_ptc=self.enable_ptc,
+            enable_ptc=enable_ptc,
         )
 
     def _setup_ptc_sandbox_tools(self, sandbox: StatefulSandbox, env: TaskSyncEnvState) -> dict:

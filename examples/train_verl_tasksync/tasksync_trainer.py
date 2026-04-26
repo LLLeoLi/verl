@@ -109,6 +109,22 @@ class TaskSyncTrainer(RayPPOTrainer):
         val_ratio = float(env_cfg.get("val_ratio", 0.0))
         seed = config.get("seed", 42)
 
+        # ptc_mode = "ptc" | "no-ptc" | "mixed". In mixed mode each task is
+        # rolled out twice -- once with PTC enabled and once without -- so the
+        # effective per-batch sample count doubles. Double ppo_mini_batch_size
+        # to keep the per-step PPO update semantics unchanged.
+        self.ptc_mode = env_cfg.get("ptc_mode", "ptc")
+        assert self.ptc_mode in ("ptc", "no-ptc", "mixed"), (
+            f"ptc_mode must be 'ptc', 'no-ptc', or 'mixed', got '{self.ptc_mode}'"
+        )
+        if self.ptc_mode == "mixed":
+            old_mini = config.actor_rollout_ref.actor.ppo_mini_batch_size
+            with open_dict(config):
+                config.actor_rollout_ref.actor.ppo_mini_batch_size = old_mini * 2
+            logger.info(
+                f"[ptc_mode=mixed] doubled ppo_mini_batch_size: {old_mini} -> {old_mini * 2}"
+            )
+
         common_kwargs = dict(
             tasks_dir=tasks_dir,
             batch_size=env_cfg.get("batch_size", 8),
@@ -766,19 +782,32 @@ class TaskSyncTrainer(RayPPOTrainer):
 
         env_groups = dataset.get_batch(batch_index)
 
+        # In "mixed" mode each task contributes two GRPO groups -- one with PTC
+        # enabled and one without -- so they are normalized as separate groups.
+        # In pure modes there is exactly one group per task with the mode's flag.
+        if self.ptc_mode == "mixed":
+            ptc_assignments = [(True, "ptc"), (False, "noptc")]
+        elif self.ptc_mode == "ptc":
+            ptc_assignments = [(True, "ptc")]
+        else:  # no-ptc
+            ptc_assignments = [(False, "noptc")]
+
         raw_prompts = []
         task_uids = []
         for group_idx, group_builder in enumerate(env_groups):
             task_info = group_builder.task_info
             max_tool_calls = group_builder.max_tool_calls
-            task_uid = f"{task_info.get('task_name', 'unknown')}_{group_idx}"
+            task_name = task_info.get("task_name", "unknown")
 
-            for _ in range(group_builder.num_envs):
-                raw_prompts.append({
-                    "task_info": task_info,
-                    "max_tool_calls": max_tool_calls,
-                })
-                task_uids.append(task_uid)
+            for enable_ptc, ptc_tag in ptc_assignments:
+                task_uid = f"{task_name}_{group_idx}_{ptc_tag}"
+                for _ in range(group_builder.num_envs):
+                    raw_prompts.append({
+                        "task_info": task_info,
+                        "max_tool_calls": max_tool_calls,
+                        "enable_ptc": enable_ptc,
+                    })
+                    task_uids.append(task_uid)
 
         if not raw_prompts:
             logger.warning("No tasks to process, returning empty batch")

@@ -58,7 +58,7 @@ while [[ "$#" -gt 0 ]]; do
         --dump_experience_every) dump_experience_every="$2"; shift 2 ;;
         --max_tool_calls) max_tool_calls="$2"; shift 2 ;;
         --reward_type) reward_type="$2"; shift 2 ;;
-        --enable_ptc) enable_ptc="$2"; shift 2 ;;
+        --ptc_mode) ptc_mode="$2"; shift 2 ;;
         --dense_epoch) dense_epoch="$2"; shift 2 ;;
         --val_ratio) val_ratio="$2"; shift 2 ;;
         --test_freq) test_freq="$2"; shift 2 ;;
@@ -136,7 +136,11 @@ save_freq=${save_freq:-50}
 dump_experience_every=${dump_experience_every:-1}
 max_tool_calls=${max_tool_calls:-100}
 reward_type=${reward_type:-dense}
-enable_ptc=${enable_ptc:-True}
+ptc_mode=${ptc_mode:-ptc}
+case "${ptc_mode}" in
+    ptc|no-ptc|mixed) ;;
+    *) echo "ERROR: --ptc_mode must be 'ptc', 'no-ptc', or 'mixed' (got '${ptc_mode}')" >&2; exit 1 ;;
+esac
 dense_epoch=${dense_epoch:-0}
 val_ratio=${val_ratio:-0.0}
 test_freq=${test_freq:--1}
@@ -180,7 +184,7 @@ TRAIN_CMD=(
     actor_rollout_ref.env.group_size=${env_group_size}
     actor_rollout_ref.env.reward_type=${reward_type}
     actor_rollout_ref.env.max_tool_calls=${max_tool_calls}
-    actor_rollout_ref.env.enable_ptc=${enable_ptc}
+    actor_rollout_ref.env.ptc_mode=${ptc_mode}
     actor_rollout_ref.env.val_ratio=${val_ratio}
 
     # rollout
