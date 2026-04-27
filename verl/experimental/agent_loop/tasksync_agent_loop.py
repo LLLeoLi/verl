@@ -721,68 +721,99 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
                 idx = end + len("</function>")
             return calls
 
-        single = self._parse_tool_call(response)
-        if single is not None:
-            calls.append(single)
+        # JSON-style: scan for all top-level {...} blocks containing a "name" field.
+        pos = 0
+        while pos < len(response):
+            start = response.find("{", pos)
+            if start == -1:
+                break
+            end = self._find_balanced_brace(response, start)
+            if end == -1:
+                break
+            blob = response[start : end + 1]
+            parsed: Optional[dict[str, Any]] = None
+            if '"name"' in blob:
+                try:
+                    tc = json.loads(blob)
+                except (json.JSONDecodeError, ValueError):
+                    tc = None
+                if isinstance(tc, dict) and "name" in tc:
+                    args = tc.get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (json.JSONDecodeError, ValueError):
+                            args = {}
+                    parsed = {"name": tc["name"], "arguments": args}
+            if parsed is not None:
+                calls.append(parsed)
+                pos = end + 1
+            else:
+                pos = start + 1
         return calls
+
+    @staticmethod
+    def _find_balanced_brace(s: str, start: int) -> int:
+        """Return index of `}` that closes `s[start]` (which must be `{`),
+        respecting string literals. Returns -1 if unbalanced."""
+        depth = 0
+        in_str = False
+        esc = False
+        for j in range(start, len(s)):
+            c = s[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return j
+        return -1
 
     def _parse_tool_call(self, response: str) -> Optional[dict[str, Any]]:
         try:
-            if "<function=" in response:
-                func_start = response.find("<function=")
-                func_part = response[func_start + len("<function="):]
+            if "<function=" not in response:
+                return None
 
-                if ">" not in func_part:
-                    return None
-                func_name = func_part.split(">", 1)[0].strip()
-                remaining = func_part.split(">", 1)[1] if ">" in func_part else ""
+            func_start = response.find("<function=")
+            func_part = response[func_start + len("<function="):]
 
-                arguments = {}
-                if "<parameter=" in remaining:
-                    if "</function>" in remaining:
-                        params_block = remaining.split("</function>", 1)[0]
-                    elif "</tool_call>" in remaining:
-                        params_block = remaining.split("</tool_call>", 1)[0]
-                    else:
-                        params_block = remaining
+            if ">" not in func_part:
+                return None
+            func_name = func_part.split(">", 1)[0].strip()
+            remaining = func_part.split(">", 1)[1] if ">" in func_part else ""
 
-                    params = params_block.split("<parameter=")
-                    for param in params[1:]:
-                        if ">" in param:
-                            param_name = param.split(">", 1)[0].strip()
-                            if "</parameter>" in param:
-                                param_value_raw = param.split(">", 1)[1].split("</parameter>", 1)[0].strip()
-                            else:
-                                param_value_raw = param.split(">", 1)[1].split("<")[0].strip()
-                            arguments[param_name] = self._parse_param_value(param_value_raw)
+            arguments = {}
+            if "<parameter=" in remaining:
+                if "</function>" in remaining:
+                    params_block = remaining.split("</function>", 1)[0]
+                elif "</tool_call>" in remaining:
+                    params_block = remaining.split("</tool_call>", 1)[0]
+                else:
+                    params_block = remaining
 
-                return {"name": func_name, "arguments": arguments}
+                params = params_block.split("<parameter=")
+                for param in params[1:]:
+                    if ">" in param:
+                        param_name = param.split(">", 1)[0].strip()
+                        if "</parameter>" in param:
+                            param_value_raw = param.split(">", 1)[1].split("</parameter>", 1)[0].strip()
+                        else:
+                            param_value_raw = param.split(">", 1)[1].split("<")[0].strip()
+                        arguments[param_name] = self._parse_param_value(param_value_raw)
 
-            splits = response.split("{")
-            for i in range(1, len(splits)):
-                possible = "{" + "{".join(splits[i:])
-                end_idx = possible.find("}")
-                while end_idx != -1:
-                    blob = possible[:end_idx + 1]
-                    if '"name"' in blob:
-                        try:
-                            tool_call = json.loads(blob)
-                            if "name" in tool_call:
-                                args = tool_call.get("arguments", {})
-                                if isinstance(args, str):
-                                    try:
-                                        args = json.loads(args)
-                                    except (json.JSONDecodeError, ValueError):
-                                        args = {}
-                                return {"name": tool_call["name"], "arguments": args}
-                        except Exception:
-                            pass
-                    end_idx = possible.find("}", end_idx + 1)
+            return {"name": func_name, "arguments": arguments}
         except Exception as e:
             logger.warning(f"Error parsing tool call: {e}")
             return None
-
-        return None
 
     def _parse_param_value(self, param_value_raw: str) -> Any:
         if not param_value_raw:
