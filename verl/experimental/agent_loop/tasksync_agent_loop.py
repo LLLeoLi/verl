@@ -702,23 +702,26 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
     def _parse_tool_calls(self, response: str) -> list[dict[str, Any]]:
         calls: list[dict[str, Any]] = []
 
-        if "<function=" in response:
+        # XML-style: strict format -- requires <tool_call>...</tool_call> wrapper,
+        # with a properly closed <function=NAME>...</function> inside. Malformed
+        # blocks are dropped entirely.
+        open_tag = "<tool_call>"
+        close_tag = "</tool_call>"
+        if open_tag in response:
             idx = 0
             while True:
-                start = response.find("<function=", idx)
+                start = response.find(open_tag, idx)
                 if start == -1:
                     break
-                end = response.find("</function>", start)
+                end = response.find(close_tag, start + len(open_tag))
                 if end == -1:
-                    tail_call = self._parse_tool_call(response[start:])
-                    if tail_call is not None:
-                        calls.append(tail_call)
+                    logger.warning("Unclosed <tool_call> wrapper; dropping call")
                     break
-                block = response[start : end + len("</function>")]
-                parsed = self._parse_tool_call(block)
+                inner = response[start + len(open_tag) : end]
+                parsed = self._parse_tool_call(inner)
                 if parsed is not None:
                     calls.append(parsed)
-                idx = end + len("</function>")
+                idx = end + len(close_tag)
             return calls
 
         # JSON-style: scan for all top-level {...} blocks containing a "name" field.
@@ -778,37 +781,58 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
                     return j
         return -1
 
-    def _parse_tool_call(self, response: str) -> Optional[dict[str, Any]]:
+    def _parse_tool_call(self, block: str) -> Optional[dict[str, Any]]:
+        """Parse a single tool call from the contents of a <tool_call>...</tool_call>
+        block. Requires <function=NAME>...</function> to be properly closed, and
+        each <parameter=NAME>...</parameter> to be properly closed. Returns None
+        (dropping the entire call) on any malformed structure."""
         try:
-            if "<function=" not in response:
+            func_start = block.find("<function=")
+            if func_start == -1:
+                logger.warning("Tool call missing <function=...>; dropping")
                 return None
 
-            func_start = response.find("<function=")
-            func_part = response[func_start + len("<function="):]
-
-            if ">" not in func_part:
+            func_part = block[func_start + len("<function=") :]
+            name_end = func_part.find(">")
+            if name_end == -1:
+                logger.warning("Malformed <function=...> tag; dropping")
                 return None
-            func_name = func_part.split(">", 1)[0].strip()
-            remaining = func_part.split(">", 1)[1] if ">" in func_part else ""
+            func_name = func_part[:name_end].strip()
+            if not func_name:
+                logger.warning("Empty function name; dropping")
+                return None
 
-            arguments = {}
-            if "<parameter=" in remaining:
-                if "</function>" in remaining:
-                    params_block = remaining.split("</function>", 1)[0]
-                elif "</tool_call>" in remaining:
-                    params_block = remaining.split("</tool_call>", 1)[0]
-                else:
-                    params_block = remaining
+            remaining = func_part[name_end + 1 :]
+            close_idx = remaining.find("</function>")
+            if close_idx == -1:
+                logger.warning(f"Tool call '{func_name}' missing </function>; dropping")
+                return None
+            params_block = remaining[:close_idx]
 
+            arguments: dict[str, Any] = {}
+            if "<parameter=" in params_block:
                 params = params_block.split("<parameter=")
                 for param in params[1:]:
-                    if ">" in param:
-                        param_name = param.split(">", 1)[0].strip()
-                        if "</parameter>" in param:
-                            param_value_raw = param.split(">", 1)[1].split("</parameter>", 1)[0].strip()
-                        else:
-                            param_value_raw = param.split(">", 1)[1].split("<")[0].strip()
-                        arguments[param_name] = self._parse_param_value(param_value_raw)
+                    pname_end = param.find(">")
+                    if pname_end == -1:
+                        logger.warning(
+                            f"Malformed <parameter=...> in '{func_name}'; dropping call"
+                        )
+                        return None
+                    param_name = param[:pname_end].strip()
+                    if not param_name:
+                        logger.warning(f"Empty parameter name in '{func_name}'; dropping call")
+                        return None
+                    after = param[pname_end + 1 :]
+                    pclose_idx = after.find("</parameter>")
+                    if pclose_idx == -1:
+                        logger.warning(
+                            f"Parameter '{param_name}' in '{func_name}' missing "
+                            f"</parameter>; dropping call"
+                        )
+                        return None
+                    param_value_raw = after[:pclose_idx].strip()
+                    arguments[param_name] = self._parse_param_value(param_value_raw)
 
             return {"name": func_name, "arguments": arguments}
         except Exception as e:
