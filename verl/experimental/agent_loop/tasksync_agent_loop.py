@@ -302,6 +302,7 @@ class TaskSyncAgentData:
         self.success: bool = False
 
         self.programmatic_tool_call_count: int = 0
+        self.programmatic_tool_call_error_count: int = 0
         self.execute_python_count: int = 0
         self.terminal_count: int = 0
         self.env_tool_count: int = 0
@@ -341,6 +342,12 @@ class TaskSyncAgentLoop(AgentLoopBase):
         assert self.reward_type in ("dense", "binary"), (
             f"reward_type must be 'dense' or 'binary', got '{self.reward_type}'"
         )
+
+        # Per-error penalty subtracted from the final reward at end of rollout.
+        # Counts only programmatic_tool_call failures (sandbox-reported, not
+        # heuristic). The total penalty is clipped so the final reward stays
+        # non-negative. Default 0.0 disables it; opt in via env.ptc_error_penalty.
+        self.ptc_error_penalty = float(env_cfg.get("ptc_error_penalty", 0.0))
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
@@ -540,8 +547,8 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
 {TOOLS_PROXY_SOURCE}
 
 """)
-        result = sandbox.execute(setup_code)
-        if result.startswith("[Error]"):
+        result, success = sandbox.execute(setup_code)
+        if not success:
             return {"success": False, "error": result}
         return {"success": True, "output": result}
 
@@ -673,15 +680,20 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             sandbox = env.sandbox
             if sandbox is None:
                 return "Error: Sandbox not initialized", 0.0, False
-            return sandbox.execute(code), 0.0, False
+            result, _ = sandbox.execute(code)
+            return result, 0.0, False
 
         if tool_name == "programmatic_tool_call":
             code = arguments.get("code", "")
             agent_data.programmatic_tool_call_count += 1
             ptc_sandbox = env.ptc_sandbox
             if ptc_sandbox is None:
+                agent_data.programmatic_tool_call_error_count += 1
                 return "Error: PTC sandbox not initialized", 0.0, False
-            return ptc_sandbox.execute(code), 0.0, False
+            result, success = ptc_sandbox.execute(code)
+            if not success:
+                agent_data.programmatic_tool_call_error_count += 1
+            return result, 0.0, False
 
         if tool_name == "terminal":
             command = arguments.get("command", "")
@@ -888,6 +900,12 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             or rollout_length >= self.max_model_len
         )
 
+        ptc_error_count = agent_data.programmatic_tool_call_error_count
+        ptc_error_penalty = self.ptc_error_penalty * ptc_error_count
+        # Clip to >= 0 so the penalty can never make a non-negative reward
+        # turn negative (avoids GRPO advantage flips driven purely by errors).
+        penalized_reward = max(float(agent_data.final_reward) - ptc_error_penalty, 0.0)
+
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
@@ -904,12 +922,13 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             # the agent_loop `_compute_score` path short-circuits and does not
             # invoke the generic reward_loop worker (which expects `data_source`
             # in non_tensor_batch -- task-sync never populates that field).
-            reward_score=float(agent_data.final_reward),
+            reward_score=penalized_reward,
             extra_fields={},
         )
 
         output.extra_fields["reward_extra_info"] = {
-            "episode_reward": agent_data.final_reward,
+            "episode_reward": penalized_reward,
+            "episode_reward_raw": agent_data.final_reward,
             "dense_reward": agent_data.dense_reward,
             "episode_success": agent_data.success,
             "acc": float(agent_data.success),
@@ -917,6 +936,8 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             "rollout_length": rollout_length,
             "truncated": is_truncated,
             "programmatic_tool_call_count": agent_data.programmatic_tool_call_count,
+            "programmatic_tool_call_error_count": ptc_error_count,
+            "ptc_error_penalty": ptc_error_penalty,
             "execute_python_count": agent_data.execute_python_count,
             "terminal_count": agent_data.terminal_count,
             "env_tool_count": agent_data.env_tool_count,
@@ -944,6 +965,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             extra_fields={
                 "reward_extra_info": {
                     "episode_reward": 0.0,
+                    "episode_reward_raw": 0.0,
                     "dense_reward": 0.0,
                     "episode_success": False,
                     "acc": 0.0,
@@ -951,6 +973,8 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
                     "rollout_length": 0,
                     "truncated": False,
                     "programmatic_tool_call_count": 0,
+                    "programmatic_tool_call_error_count": 0,
+                    "ptc_error_penalty": 0.0,
                     "execute_python_count": 0,
                     "terminal_count": 0,
                     "env_tool_count": 0,

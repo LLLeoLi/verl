@@ -533,34 +533,39 @@ class StatefulSandbox:
 
         return strip_ansi("".join(out_parts)), strip_ansi("".join(err_parts)), success
 
-    def execute(self, code: str) -> str:
-        """Execute code and return output as a string.
+    def execute(self, code: str) -> tuple[str, bool]:
+        """Execute code and return (output, success).
 
         State from previous calls is preserved. Returns an error string on
-        failure rather than raising, to match the old run_python_code interface.
+        failure rather than raising. ``success`` is False whenever the kernel
+        reported an exception, the sandbox was unavailable, or execution timed
+        out -- i.e. any case where ``output`` carries an error message.
         """
         if self._client is None:
-            return "[Error] Sandbox not started. Call start() first."
+            return "[Error] Sandbox not started. Call start() first.", False
         if self._dead:
             return (
                 "[Error] Sandbox is no longer available "
                 "(killed after a previous timeout / crash). Subsequent code will not run."
-            )
+            ), False
         try:
             output, error, success = self._run(code)
             result = output
             if error.strip():
                 result += ("\n[stderr]:\n" if result else "") + error.strip()
-            return result.strip() if result.strip() else "(no output)"
+            return (result.strip() if result.strip() else "(no output)"), success
         except TimeoutError:
             suffix = (
                 " Sandbox killed; subsequent code will not run."
                 if self._dead
                 else " Sandbox interrupted; state preserved."
             )
-            return f"[Error] Code execution timed out ({self.timeout}-second limit).{suffix}"
+            return (
+                f"[Error] Code execution timed out ({self.timeout}-second limit).{suffix}",
+                False,
+            )
         except Exception as e:
-            return f"[Error] {e}"
+            return f"[Error] {e}", False
 
     def cleanup(self):
         """Stop the kernel and remove temporary files."""

@@ -302,15 +302,18 @@ class TaskSyncTrainer(RayPPOTrainer):
             return {}
 
         # ---- reward/* (mirror of training-side planning_stats) ----
+        # `score`         : raw env-reported reward (dense_reward), unmodified.
+        # `episode_reward_mean` : reward actually fed to GRPO (post binary
+        #                   conversion + PTC penalty + non-negative clip).
         reward_metrics = {
-            "val/reward/dense_mean": float(np.mean(dense_rewards)),
-            "val/reward/dense_min": float(np.min(dense_rewards)),
-            "val/reward/dense_max": float(np.max(dense_rewards)),
+            "val/reward/score": float(np.mean(dense_rewards)),
+            "val/reward/score_min": float(np.min(dense_rewards)),
+            "val/reward/score_max": float(np.max(dense_rewards)),
             "val/reward/zero_reward_ratio": (
                 dense_rewards.count(0) / len(dense_rewards) if dense_rewards else 1.0
             ),
-            "val/reward/perfect_reward_ratio": (
-                dense_rewards.count(1.0) / len(dense_rewards) if dense_rewards else 0.0
+            "val/reward/episode_reward_mean": (
+                float(np.mean(episode_rewards)) if episode_rewards else 0.0
             ),
             "val/reward/success_rate": (
                 float(np.mean(episode_successes)) if episode_successes else 0.0
@@ -910,14 +913,14 @@ class TaskSyncTrainer(RayPPOTrainer):
             "group_status/mean_episode_len": float(np.mean(episode_turns)) if episode_turns else 0.0,
             "group_status/mean_rollout_length": float(np.mean(rollout_lengths)) if rollout_lengths else 0.0,
             "group_status/truncated_rollouts": int(sum(truncated_flags)) if truncated_flags else 0,
-            "reward/dense_mean": float(np.mean(dense_rewards)) if dense_rewards else 0.0,
-            "reward/dense_min": float(np.min(dense_rewards)) if dense_rewards else 0.0,
-            "reward/dense_max": float(np.max(dense_rewards)) if dense_rewards else 0.0,
+            "reward/score": float(np.mean(dense_rewards)) if dense_rewards else 0.0,
+            "reward/score_min": float(np.min(dense_rewards)) if dense_rewards else 0.0,
+            "reward/score_max": float(np.max(dense_rewards)) if dense_rewards else 0.0,
             "reward/zero_reward_ratio": (
                 dense_rewards.count(0) / len(dense_rewards) if dense_rewards else 1.0
             ),
-            "reward/perfect_reward_ratio": (
-                dense_rewards.count(1.0) / len(dense_rewards) if dense_rewards else 0.0
+            "reward/episode_reward_mean": (
+                float(np.mean(episode_rewards)) if episode_rewards else 0.0
             ),
             "reward/success_rate": (
                 float(np.mean(episode_successes)) if episode_successes else 0.0
@@ -928,7 +931,8 @@ class TaskSyncTrainer(RayPPOTrainer):
         if not validate:
             logger.info(
                 f"Rollout done: bsz={batch_size}, success_rate={planning_stats['reward/success_rate']:.2%}, "
-                f"dense_mean={planning_stats['reward/dense_mean']:.4f}, "
+                f"score={planning_stats['reward/score']:.4f}, "
+                f"episode_reward={planning_stats['reward/episode_reward_mean']:.4f}, "
                 f"mean_rollout_length={planning_stats['group_status/mean_rollout_length']:.1f}, "
                 f"truncated={planning_stats['group_status/truncated_rollouts']}, "
                 f"mean_ptc={np.mean(ptc_counts) if ptc_counts else 0:.2f}"

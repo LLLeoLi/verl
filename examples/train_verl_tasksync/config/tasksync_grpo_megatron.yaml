@@ -53,6 +53,10 @@ actor_rollout_ref:
     #           "mixed" -> each task contributes both PTC and no-PTC groups
     #                     (effective batch doubles; ppo_mini_batch_size auto-doubled).
     ptc_mode: ptc
+    # Per-error penalty subtracted from final reward (counts only
+    # programmatic_tool_call failures). 0.0 disables; final reward is clipped
+    # to >= 0 so the penalty can't flip a successful rollout negative.
+    ptc_error_penalty: 0.0
     val_ratio: 0.0          # 0 disables validation; e.g. 0.05 holds out 5% of tasks
 
   # Custom: how often to dump per-episode experiences (JSON). -1 disables.
