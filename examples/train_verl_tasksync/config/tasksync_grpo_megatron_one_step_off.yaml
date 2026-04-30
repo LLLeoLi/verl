@@ -106,6 +106,17 @@ actor_rollout_ref:
     # Read by core_algos when bypass_mode loss is active.
     use_rollout_log_probs: true
 
+    # model.enable_gradient_checkpointing is FSDP-only and silently ignored by
+    # the megatron engine. These three knobs enable megatron's own activation
+    # recompute -- required for long-context MoE training, otherwise every
+    # layer's activations are kept on-GPU through forward and OOM hits
+    # mid-forward (typically inside MoE permute/unpermute) before backward.
+    megatron:
+      override_transformer_config:
+        recompute_granularity: full
+        recompute_method: uniform
+        recompute_num_layers: 1
+
 algorithm:
   adv_estimator: grpo
   gamma: 1.0

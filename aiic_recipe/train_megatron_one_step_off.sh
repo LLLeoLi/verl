@@ -114,7 +114,7 @@ weight_decay=${weight_decay:-0.1}
 # ==============================================================================
 actor_tp=${actor_tp:-4}
 actor_pp=${actor_pp:-2}
-actor_cp=${actor_cp:-4}
+actor_cp=${actor_cp:-2}
 actor_ep=${actor_ep:-8}
 actor_etp=${actor_etp:-1}
 
