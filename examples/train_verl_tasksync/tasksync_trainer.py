@@ -249,6 +249,8 @@ class TaskSyncTrainer(RayPPOTrainer):
 
         # Tool usage
         ptc_counts: list[int] = []
+        ptc_error_counts: list[int] = []
+        ptc_error_penalties: list[float] = []
         python_counts: list[int] = []
         terminal_counts: list[int] = []
         env_tool_counts: list[int] = []
@@ -279,6 +281,8 @@ class TaskSyncTrainer(RayPPOTrainer):
             rollout_lengths.extend(_as_list("rollout_length"))
             truncated_flags.extend(_as_list("truncated"))
             ptc_counts.extend(_as_list("programmatic_tool_call_count"))
+            ptc_error_counts.extend(_as_list("programmatic_tool_call_error_count"))
+            ptc_error_penalties.extend(_as_list("ptc_error_penalty"))
             python_counts.extend(_as_list("execute_python_count"))
             terminal_counts.extend(_as_list("terminal_count"))
             env_tool_counts.extend(_as_list("env_tool_count"))
@@ -344,6 +348,9 @@ class TaskSyncTrainer(RayPPOTrainer):
             "val/group_status/mean_ptc_count": (
                 float(np.mean(ptc_counts)) if ptc_counts else 0.0
             ),
+            "val/group_status/mean_ptc_error_count": (
+                float(np.mean(ptc_error_counts)) if ptc_error_counts else 0.0
+            ),
             "val/group_status/mean_python_count": (
                 float(np.mean(python_counts)) if python_counts else 0.0
             ),
@@ -352,6 +359,9 @@ class TaskSyncTrainer(RayPPOTrainer):
             ),
             "val/group_status/mean_env_tool_count": (
                 float(np.mean(env_tool_counts)) if env_tool_counts else 0.0
+            ),
+            "val/reward/mean_ptc_error_penalty": (
+                float(np.mean(ptc_error_penalties)) if ptc_error_penalties else 0.0
             ),
         }
 
@@ -513,6 +523,8 @@ class TaskSyncTrainer(RayPPOTrainer):
                         return float(np.mean(vals)) if vals else 0.0
 
                     mean_ptc_count = _mean_of("programmatic_tool_call_count")
+                    mean_ptc_error_count = _mean_of("programmatic_tool_call_error_count")
+                    mean_ptc_error_penalty = _mean_of("ptc_error_penalty")
                     mean_python_count = _mean_of("execute_python_count")
                     mean_terminal_count = _mean_of("terminal_count")
                     mean_env_tool_count = _mean_of("env_tool_count")
@@ -521,7 +533,9 @@ class TaskSyncTrainer(RayPPOTrainer):
                         f"Group statistics: total={total_groups}, "
                         f"all_zero={all_zero_groups} ({all_zero_ratio:.2%}), "
                         f"all_one={all_one_groups} ({all_one_ratio:.2%}), "
-                        f"mean_ptc={mean_ptc_count:.2f}, mean_py={mean_python_count:.2f}, "
+                        f"mean_ptc={mean_ptc_count:.2f}, mean_ptc_err={mean_ptc_error_count:.2f}, "
+                        f"mean_ptc_penalty={mean_ptc_error_penalty:.4f}, "
+                        f"mean_py={mean_python_count:.2f}, "
                         f"mean_term={mean_terminal_count:.2f}, mean_env_tool={mean_env_tool_count:.2f}"
                     )
 
@@ -531,9 +545,11 @@ class TaskSyncTrainer(RayPPOTrainer):
                         "group_status/all_one_groups": all_one_groups,
                         "group_status/all_one_ratio": all_one_ratio,
                         "group_status/mean_ptc_count": mean_ptc_count,
+                        "group_status/mean_ptc_error_count": mean_ptc_error_count,
                         "group_status/mean_python_count": mean_python_count,
                         "group_status/mean_terminal_count": mean_terminal_count,
                         "group_status/mean_env_tool_count": mean_env_tool_count,
+                        "reward/mean_ptc_error_penalty": mean_ptc_error_penalty,
                     })
 
                     # ============================
