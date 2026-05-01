@@ -164,8 +164,8 @@ def parse_args():
                         help="矩阵数据类型")
     parser.add_argument("--mode", choices=["process", "thread"], default="process",
                         help="并发模式")
-    parser.add_argument("--minutes", type=float, default=300.0,
-                        help="占卡分钟数,超过后自动释放;<=0 表示无限运行(默认 300)")
+    parser.add_argument("--minutes", type=float, default=240.0,
+                        help="占卡分钟数,超过后自动释放;<=0 表示无限运行(默认 240)")
     return parser.parse_args()
 
 
