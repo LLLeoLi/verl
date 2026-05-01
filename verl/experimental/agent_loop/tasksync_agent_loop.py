@@ -184,29 +184,18 @@ class TaskSyncEnvState:
                 },
             })
 
-        allowed_commands_desc = ", ".join(sorted(TerminalExecutor.ALLOWED_COMMANDS))
         tool_schemas.append({
             "type": "function",
             "function": {
                 "name": "terminal",
-                "description": (
-                    f"Allows command (CLI) execution in the workspace directory.\n\n"
-                    f"Available commands: {allowed_commands_desc}\n"
-                    "All other commands (e.g. grep, awk, sed, wc, sort, etc.) are NOT available. "
-                    "Use execute_python for any processing beyond simple file listing/reading.\n"
-                    "Available flags: all flags supported\n\n"
-                    "Shell operators (&&, ||, |, >, >>, <, <<, ;) are NOT supported."
-                ),
+                "description": "Execute a shell command in the workspace directory.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": {
                             "type": "string",
                             "description": (
-                                "Shell command to execute. Examples:\n"
-                                "  ls -la\n"
-                                "  find . -name '*.csv'\n"
-                                "  cat report.txt"
+                                "Shell command to execute (e.g., \"ls -la\", \"grep -c foo data.csv\")."
                             ),
                         }
                     },
