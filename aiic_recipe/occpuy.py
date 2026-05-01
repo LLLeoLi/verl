@@ -39,14 +39,18 @@ def worker(rank: int, args, deadline: float | None):
     dtype = torch.float16 if args.dtype == "fp16" else torch.float32
     bytes_per_elem = 2 if args.dtype == "fp16" else 4
 
-    # 计算矩阵边长 N,使 A + B + C 各一份恰好占满目标显存
-    target_bytes = int(args.mem_gb * 1024**3)
+    # 计算矩阵边长 N。
+    # 峰值显存 ≈ A + B + C + cuBLAS workspace + 缓存碎片。
+    # 给 workspace/碎片留 6 GB headroom,sizing 只针对 A+B+C 三份。
+    workspace_headroom_bytes = 6 * 1024**3
+    target_bytes = max(int(args.mem_gb * 1024**3) - workspace_headroom_bytes, 1024**3)
     N = int(math.sqrt(target_bytes / (3 * bytes_per_elem)))
     N = (N // 64) * 64   # 对齐到 64,Tensor Core 友好
 
     actual_gb = 3 * N * N * bytes_per_elem / 1024**3
     print(
-        f"[GPU {rank}] 矩阵边长 N={N:,}  dtype={dtype}  预计占用 {actual_gb:.2f} GB",
+        f"[GPU {rank}] 矩阵边长 N={N:,}  dtype={dtype}  "
+        f"A+B+C≈{actual_gb:.2f} GB (+~6GB workspace)",
         flush=True,
     )
 
@@ -86,6 +90,10 @@ def worker(rank: int, args, deadline: float | None):
 
             if step % 100 == 0:
                 A, B = B, C
+    except Exception as e:
+        import traceback
+        print(f"[GPU {rank}] worker 异常退出: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
     finally:
         del A, B
         try:
@@ -150,8 +158,8 @@ def parse_args():
                         help="使用的 GPU 数量(默认 8)")
     parser.add_argument("--gpu_ids", type=int, nargs="+", default=None,
                         help="指定具体的 GPU 编号,例如 --gpu_ids 0 1 4 5")
-    parser.add_argument("--mem_gb", type=float, default=60.0,
-                        help="每卡目标显存占用 GB(默认 60)")
+    parser.add_argument("--mem_gb", type=float, default=30.0,
+                        help="每卡目标显存占用 GB(默认 30)")
     parser.add_argument("--dtype", choices=["fp32", "fp16"], default="fp32",
                         help="矩阵数据类型")
     parser.add_argument("--mode", choices=["process", "thread"], default="process",
