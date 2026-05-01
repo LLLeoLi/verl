@@ -575,7 +575,13 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             action = arguments.get("action", "")
             try:
                 reward, info = env.step(action)
-                dense_reward = float(reward)
+                raw_reward = float(reward)
+                if raw_reward < 0.0 or raw_reward > 1.0:
+                    logger.warning(
+                        f"task '{env.task_name}' returned out-of-range score {raw_reward}; "
+                        f"clamping to [0, 1]"
+                    )
+                dense_reward = max(0.0, min(raw_reward, 1.0))
                 agent_data.dense_reward = dense_reward
                 agent_data.success = True
                 if reward_type == "binary":
