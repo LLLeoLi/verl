@@ -65,6 +65,7 @@ while [[ "$#" -gt 0 ]]; do
         --test_freq) test_freq="$2"; shift 2 ;;
         --suffix) suffix="$2"; shift 2 ;;
         --sm_warmup) sm_warmup="$2"; shift 2 ;;
+        --agent_loop) agent_loop="$2"; shift 2 ;;
         *) break ;;
     esac
 done
@@ -147,6 +148,7 @@ dense_epoch=${dense_epoch:-0}
 val_ratio=${val_ratio:-0.0}
 test_freq=${test_freq:--1}
 sm_warmup=${sm_warmup:-False}
+agent_loop=${agent_loop:-tasksync_agent}
 
 # ==============================================================================
 # Experiment name
@@ -198,7 +200,7 @@ TRAIN_CMD=(
     actor_rollout_ref.rollout.max_model_len=${total_len}
     actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp}
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization}
-    actor_rollout_ref.rollout.agent.default_agent_loop=tasksync_agent
+    actor_rollout_ref.rollout.agent.default_agent_loop=${agent_loop}
     actor_rollout_ref.rollout.agent.num_workers=${num_workers}
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${ppo_micro_bsz_per_gpu}
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${max_token_len_per_gpu}
