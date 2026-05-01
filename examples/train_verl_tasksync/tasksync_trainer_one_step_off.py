@@ -353,10 +353,15 @@ class TaskSyncOneStepOffTrainer(OneStepOffRayTrainer):
 
         episode_rewards, episode_successes, dense_rewards, episode_turns = [], [], [], []
         rollout_lengths, truncated_flags, ptc_counts = [], [], []
+        ptc_error_counts, ptc_error_penalties = [], []
+        python_counts, terminal_counts, env_tool_counts = [], [], []
+        episode_rewards_raw: list = []
         if output.non_tensor_batch:
             ntb = output.non_tensor_batch
             if "episode_reward" in ntb:
                 episode_rewards = ntb["episode_reward"].tolist()
+            if "episode_reward_raw" in ntb:
+                episode_rewards_raw = ntb["episode_reward_raw"].tolist()
             if "episode_success" in ntb:
                 episode_successes = ntb["episode_success"].tolist()
             if "dense_reward" in ntb:
@@ -369,6 +374,16 @@ class TaskSyncOneStepOffTrainer(OneStepOffRayTrainer):
                 truncated_flags = ntb["truncated"].tolist()
             if "programmatic_tool_call_count" in ntb:
                 ptc_counts = ntb["programmatic_tool_call_count"].tolist()
+            if "programmatic_tool_call_error_count" in ntb:
+                ptc_error_counts = ntb["programmatic_tool_call_error_count"].tolist()
+            if "ptc_error_penalty" in ntb:
+                ptc_error_penalties = ntb["ptc_error_penalty"].tolist()
+            if "execute_python_count" in ntb:
+                python_counts = ntb["execute_python_count"].tolist()
+            if "terminal_count" in ntb:
+                terminal_counts = ntb["terminal_count"].tolist()
+            if "env_tool_count" in ntb:
+                env_tool_counts = ntb["env_tool_count"].tolist()
 
         if output.batch is not None and "response_mask" in output.batch:
             response_mask = output.batch["response_mask"]
@@ -397,11 +412,40 @@ class TaskSyncOneStepOffTrainer(OneStepOffRayTrainer):
                 scalar_rewards, dtype=np.float32
             )
 
+        # Per-uid reward grouping for all-zero / all-one group ratios.
+        uid2rewards: dict = defaultdict(list)
+        if episode_rewards and len(task_uids) == len(episode_rewards):
+            for uid, r in zip(task_uids, episode_rewards, strict=False):
+                uid2rewards[uid].append(r)
+        total_groups = len(uid2rewards)
+        all_zero_groups = sum(1 for vals in uid2rewards.values() if all(v == 0 for v in vals))
+        all_one_groups = sum(1 for vals in uid2rewards.values() if all(v == 1 for v in vals))
+        all_zero_ratio = all_zero_groups / total_groups if total_groups else 0.0
+        all_one_ratio = all_one_groups / total_groups if total_groups else 0.0
+
         output.meta_info["timing"] = {"actor_time": time.time() - generate_st}
         planning_stats = {
+            "group_status/total_groups": total_groups,
+            "group_status/all_zero_groups": all_zero_groups,
+            "group_status/all_zero_ratio": all_zero_ratio,
+            "group_status/all_one_groups": all_one_groups,
+            "group_status/all_one_ratio": all_one_ratio,
             "group_status/mean_episode_len": float(np.mean(episode_turns)) if episode_turns else 0.0,
             "group_status/mean_rollout_length": float(np.mean(rollout_lengths)) if rollout_lengths else 0.0,
             "group_status/truncated_rollouts": int(sum(truncated_flags)) if truncated_flags else 0,
+            "group_status/mean_ptc_count": float(np.mean(ptc_counts)) if ptc_counts else 0.0,
+            "group_status/mean_ptc_error_count": (
+                float(np.mean(ptc_error_counts)) if ptc_error_counts else 0.0
+            ),
+            "group_status/mean_python_count": (
+                float(np.mean(python_counts)) if python_counts else 0.0
+            ),
+            "group_status/mean_terminal_count": (
+                float(np.mean(terminal_counts)) if terminal_counts else 0.0
+            ),
+            "group_status/mean_env_tool_count": (
+                float(np.mean(env_tool_counts)) if env_tool_counts else 0.0
+            ),
             "reward/score": float(np.mean(dense_rewards)) if dense_rewards else 0.0,
             "reward/score_min": float(np.min(dense_rewards)) if dense_rewards else 0.0,
             "reward/score_max": float(np.max(dense_rewards)) if dense_rewards else 0.0,
@@ -410,6 +454,12 @@ class TaskSyncOneStepOffTrainer(OneStepOffRayTrainer):
             ),
             "reward/episode_reward_mean": (
                 float(np.mean(episode_rewards)) if episode_rewards else 0.0
+            ),
+            "reward/episode_reward_raw_mean": (
+                float(np.mean(episode_rewards_raw)) if episode_rewards_raw else 0.0
+            ),
+            "reward/mean_ptc_error_penalty": (
+                float(np.mean(ptc_error_penalties)) if ptc_error_penalties else 0.0
             ),
             "reward/success_rate": (
                 float(np.mean(episode_successes)) if episode_successes else 0.0
@@ -425,7 +475,12 @@ class TaskSyncOneStepOffTrainer(OneStepOffRayTrainer):
                 f"episode_reward={planning_stats['reward/episode_reward_mean']:.4f}, "
                 f"mean_rollout_length={planning_stats['group_status/mean_rollout_length']:.1f}, "
                 f"truncated={planning_stats['group_status/truncated_rollouts']}, "
-                f"mean_ptc={np.mean(ptc_counts) if ptc_counts else 0:.2f}"
+                f"mean_ptc={planning_stats['group_status/mean_ptc_count']:.2f}, "
+                f"mean_ptc_err={planning_stats['group_status/mean_ptc_error_count']:.2f}, "
+                f"mean_ptc_penalty={planning_stats['reward/mean_ptc_error_penalty']:.4f}, "
+                f"groups={planning_stats['group_status/total_groups']} "
+                f"(all_zero={planning_stats['group_status/all_zero_ratio']:.2%}, "
+                f"all_one={planning_stats['group_status/all_one_ratio']:.2%})"
             )
 
         if (
