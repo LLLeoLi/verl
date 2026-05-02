@@ -164,7 +164,7 @@ if [ -n "${suffix}" ]; then
     suffix_str="-${suffix}"
 fi
 exp_name=${exp_name:-"${DATE}-tasksync-30b-a3b-${loss_mode}-tp${actor_tp}-pp${actor_pp}-cp${actor_cp}-ep${actor_ep}-etp${actor_etp}-bsz${ppo_micro_bsz_per_gpu}-total_epochs${total_epochs}-group_size${env_group_size}-reward_type${reward_type}${dense_epoch_suffix}${suffix_str}"}
-ckpt_root=${ckpt_root:-"/mnt/bn/tiktok-mm-5/aiic/users/lihao.612/gem_checkpoints/${exp_name}"}
+ckpt_root=${ckpt_root:-"/mnt/hdfs/tiktok_aiic/user/lihao.612/tasksync_ckpts/${exp_name}"}
 
 echo "${exp_name}"
 
