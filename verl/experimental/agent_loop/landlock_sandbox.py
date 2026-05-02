@@ -541,6 +541,12 @@ class StatefulSandbox:
         reported an exception, the sandbox was unavailable, or execution timed
         out -- i.e. any case where ``output`` carries an error message.
         """
+        if not isinstance(code, str):
+            return (
+                f"[Error] The 'code' argument must be a string, got "
+                f"{type(code).__name__}: {code!r}.",
+                False,
+            )
         if self._client is None:
             return "[Error] Sandbox not started. Call start() first.", False
         if self._dead:

@@ -16,6 +16,11 @@ class TerminalExecutor:
         self.timeout = timeout
 
     def execute(self, command_string: str) -> str:
+        if not isinstance(command_string, str):
+            raise TerminalError(
+                f"The 'command' argument must be a string, got {type(command_string).__name__}: "
+                f"{command_string!r}. Pass a shell command, e.g. {{\"command\": \"ls -la\"}}."
+            )
         if not command_string or not command_string.strip():
             raise TerminalError(
                 "The 'command' argument is empty. Pass a non-empty shell command, "

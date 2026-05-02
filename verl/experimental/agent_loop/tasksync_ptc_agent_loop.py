@@ -362,26 +362,36 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
             state = AgentState.PENDING
             tool_call_count = 0
 
-            while state != AgentState.TERMINATED:
-                if state == AgentState.PENDING:
-                    state = await self._handle_pending_state(agent_data, sampling_params)
-                elif state == AgentState.GENERATING:
-                    if len(agent_data.response_mask) >= self.response_length:
-                        state = AgentState.TERMINATED
-                        continue
-                    if tool_call_count >= max_tool_calls:
-                        state = AgentState.TERMINATED
-                        continue
-                    if len(agent_data.prompt_ids) >= self.max_model_len - 1:
-                        state = AgentState.TERMINATED
-                        continue
+            try:
+                while state != AgentState.TERMINATED:
+                    if state == AgentState.PENDING:
+                        state = await self._handle_pending_state(agent_data, sampling_params)
+                    elif state == AgentState.GENERATING:
+                        if len(agent_data.response_mask) >= self.response_length:
+                            state = AgentState.TERMINATED
+                            continue
+                        if tool_call_count >= max_tool_calls:
+                            state = AgentState.TERMINATED
+                            continue
+                        if len(agent_data.prompt_ids) >= self.max_model_len - 1:
+                            state = AgentState.TERMINATED
+                            continue
 
-                    state = await self._handle_generating_state(agent_data, sampling_params)
-                elif state == AgentState.PROCESSING_TOOL:
-                    tool_call_count += len(agent_data.current_tool_calls)
-                    state = await self._handle_processing_tool_state(agent_data, reward_type=reward_type)
-                else:
-                    state = AgentState.TERMINATED
+                        state = await self._handle_generating_state(agent_data, sampling_params)
+                    elif state == AgentState.PROCESSING_TOOL:
+                        tool_call_count += len(agent_data.current_tool_calls)
+                        state = await self._handle_processing_tool_state(agent_data, reward_type=reward_type)
+                    else:
+                        state = AgentState.TERMINATED
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error in agent loop for task "
+                    f"{getattr(env, 'task_name', '?')}: {e}",
+                    exc_info=True,
+                )
+                agent_data.metrics["agent_loop_error"] = str(e)
+                agent_data.done = True
+                agent_data.final_reward = 0.0
 
         finally:
             if ptc_sandbox is not None:
@@ -533,9 +543,19 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             tool_name = tool_call.get("name", "")
             tool_args = tool_call.get("arguments", {})
 
-            observation, reward, done = self._execute_tool(
-                env, tool_name, tool_args, agent_data, reward_type=reward_type
-            )
+            try:
+                observation, reward, done = self._execute_tool(
+                    env, tool_name, tool_args, agent_data, reward_type=reward_type
+                )
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error executing tool '{tool_name}' "
+                    f"with args {tool_args!r}: {e}",
+                    exc_info=True,
+                )
+                observation = json.dumps({"error": f"Tool execution failed: {e}"})
+                reward = 0.0
+                done = False
             tool_messages.append({"role": "tool", "content": observation, "name": tool_name})
 
             if done:
