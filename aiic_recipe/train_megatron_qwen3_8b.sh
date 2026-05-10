@@ -1,20 +1,22 @@
 #!/bin/bash
 # ==============================================================================
-# Entry script for training TaskSync agents with verl 0.7.1.
+# Entry script for training Qwen3-8B (dense, thinking-mode) TaskSync agents.
+#
+# Differences vs train_megatron.sh (which targets Qwen3-Coder-30B-A3B MoE):
+#   - default model_path -> Qwen3-8B
+#   - response_len bumped to 75000
+#   - parallelism retuned for dense 8B: tp=4 cp=2 pp=1 ep=1
+#   - all MoE-only megatron overrides removed
+#   - tool_call_format=json (Qwen3-8B emits Hermes JSON inside <tool_call>)
 #
 # Usage (from the verl repo root):
-#   NNODES=2 NGPUS_PER_NODE=8 bash aiic_recipe/train_megatron.sh \
+#   NNODES=2 NGPUS_PER_NODE=8 bash aiic_recipe/train_megatron_qwen3_8b.sh \
 #       [--exp_name ...] [--model_path ...] [...]
-#
-# All --flag values listed below have sane defaults; anything passed after the
-# recognised flags is forwarded verbatim to Hydra (e.g. `+foo.bar=baz`).
 # ==============================================================================
 set -x
 
-# Ease multi-epoch CUDA-allocator fragmentation.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Resolve repo root from the script location so this runs from anywhere.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -46,8 +48,6 @@ while [[ "$#" -gt 0 ]]; do
         --actor_tp) actor_tp="$2"; shift 2 ;;
         --actor_pp) actor_pp="$2"; shift 2 ;;
         --actor_cp) actor_cp="$2"; shift 2 ;;
-        --actor_ep) actor_ep="$2"; shift 2 ;;
-        --actor_etp) actor_etp="$2"; shift 2 ;;
         --offload) offload="$2"; shift 2 ;;
         --offload_fraction) offload_fraction="$2"; shift 2 ;;
         --use_mbridge) use_mbridge="$2"; shift 2 ;;
@@ -66,6 +66,7 @@ while [[ "$#" -gt 0 ]]; do
         --suffix) suffix="$2"; shift 2 ;;
         --sm_warmup) sm_warmup="$2"; shift 2 ;;
         --agent_loop) agent_loop="$2"; shift 2 ;;
+        --tool_call_format) tool_call_format="$2"; shift 2 ;;
         *) break ;;
     esac
 done
@@ -73,22 +74,16 @@ done
 # ==============================================================================
 # Model / data paths
 # ==============================================================================
-model_path=${model_path:-/opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct}
-# Loader mode:
-#   use_dist_checkpointing=False (default) -> mbridge loads weights directly from
-#     model_path (HF format) at startup; no offline mcore conversion needed.
-#   use_dist_checkpointing=True            -> load a pre-converted mcore dist
-#     checkpoint from dist_ckpt_path (legacy path, requires setup.sh --mcore).
+model_path=${model_path:-/opt/tiger/entry/Qwen3-8B}
 use_dist_checkpointing=${use_dist_checkpointing:-False}
 dist_ckpt_path=${dist_ckpt_path:-null}
-# Resolved against REPO_ROOT since we cd'd there above.
 data_dir=${data_dir:-task-sync/claude-sync-v4/opus}
 
 # ==============================================================================
 # Sequence lengths
 # ==============================================================================
 prompt_len=${prompt_len:-5600}
-response_len=${response_len:-25600}
+response_len=${response_len:-75000}
 total_len=$((prompt_len + response_len))
 
 # ==============================================================================
@@ -108,22 +103,16 @@ lr_warmup_steps=${lr_warmup_steps:-10}
 weight_decay=${weight_decay:-0.1}
 
 # ==============================================================================
-# Parallelism
+# Parallelism (Qwen3-8B dense)
+#   tp=4 cp=2 pp=1 -> 8-way model parallel; with NGPUS=16 gives DP=2.
+#   cp=2 is required so max_token_len_per_gpu * cp >= total_len fits.
 # ==============================================================================
-rollout_tp=${rollout_tp:-8}
-actor_tp=${actor_tp:-2}
-actor_pp=${actor_pp:-2}
+rollout_tp=${rollout_tp:-4}
+actor_tp=${actor_tp:-4}
+actor_pp=${actor_pp:-1}
 actor_cp=${actor_cp:-2}
-actor_ep=${actor_ep:-8}
-actor_etp=${actor_etp:-1}
 
-# ==============================================================================
-# Dynamic-batch per-GPU token budget (per micro-batch).
-# Effective budget = max_token_len_per_gpu * context_parallel_size.
-# Constraint: max_token_len_per_gpu * actor_cp >= total_len (single-seq max).
-# Default sizes it exactly to ceil(total_len / actor_cp) so each micro-batch
-# carries one sequence -- avoids MoE permute activation blow-ups under packing.
-# ==============================================================================
+# Per-GPU token budget: ceil(total_len / cp) keeps one sequence per micro-batch.
 max_token_len_per_gpu=${max_token_len_per_gpu:-$(( (total_len + actor_cp - 1) / actor_cp ))}
 
 # ==============================================================================
@@ -149,6 +138,8 @@ val_ratio=${val_ratio:-0.0}
 test_freq=${test_freq:--1}
 sm_warmup=${sm_warmup:-False}
 agent_loop=${agent_loop:-tasksync_agent}
+# Qwen3-8B emits Hermes-style JSON inside <tool_call>...</tool_call>.
+tool_call_format=${tool_call_format:-json}
 
 # ==============================================================================
 # Experiment name
@@ -163,17 +154,13 @@ suffix_str=""
 if [ -n "${suffix}" ]; then
     suffix_str="-${suffix}"
 fi
-exp_name=${exp_name:-"${DATE}-${loss_mode}-tp${actor_tp}-pp${actor_pp}-cp${actor_cp}-ep${actor_ep}-etp${actor_etp}-bsz${ppo_micro_bsz_per_gpu}-total_epochs${total_epochs}-group_size${env_group_size}-reward_type${reward_type}${dense_epoch_suffix}${suffix_str}"}
+exp_name=${exp_name:-"${DATE}-qwen3_8b-${loss_mode}-tp${actor_tp}-pp${actor_pp}-cp${actor_cp}-bsz${ppo_micro_bsz_per_gpu}-total_epochs${total_epochs}-group_size${env_group_size}-reward_type${reward_type}${dense_epoch_suffix}${suffix_str}"}
 ckpt_root=${ckpt_root:-"/mnt/hdfs/tiktok_aiic/user/lihao.612/tasksync_ckpts/${exp_name}"}
 
 echo "${exp_name}"
 
 # ==============================================================================
 # Build training command
-#
-# NOTE: we do NOT pass --config-path. The @hydra.main decorator in
-# train_tasksync.py already resolves the config relative to the module file
-# (examples/train_verl_tasksync/config/), which works regardless of CWD.
 # ==============================================================================
 TRAIN_CMD=(
     python3 -m examples.train_verl_tasksync.train_tasksync
@@ -191,6 +178,7 @@ TRAIN_CMD=(
     actor_rollout_ref.env.ptc_mode=${ptc_mode}
     actor_rollout_ref.env.ptc_error_penalty=${ptc_error_penalty}
     actor_rollout_ref.env.val_ratio=${val_ratio}
+    +actor_rollout_ref.env.tool_call_format=${tool_call_format}
 
     # rollout
     actor_rollout_ref.rollout.mode=async
@@ -219,7 +207,7 @@ TRAIN_CMD=(
     actor_rollout_ref.actor.loss_agg_mode="token-mean"
     actor_rollout_ref.actor.checkpoint.save_contents='["model","optimizer","extra"]'
 
-    # actor megatron parallelism
+    # actor megatron parallelism (dense; no expert dims)
     actor_rollout_ref.actor.megatron.use_mbridge=${use_mbridge}
     actor_rollout_ref.actor.megatron.use_dist_checkpointing=${use_dist_checkpointing}
     actor_rollout_ref.actor.megatron.dist_checkpointing_path=${dist_ckpt_path}
@@ -229,10 +217,8 @@ TRAIN_CMD=(
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${actor_tp}
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${actor_pp}
     actor_rollout_ref.actor.megatron.context_parallel_size=${actor_cp}
-    actor_rollout_ref.actor.megatron.expert_model_parallel_size=${actor_ep}
-    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${actor_etp}
 
-    # actor megatron fused kernels
+    # actor megatron fused kernels (dense-safe)
     +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.masked_softmax_fusion=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.bias_activation_fusion=True
@@ -240,13 +226,6 @@ TRAIN_CMD=(
     +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.deallocate_pipeline_outputs=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.persist_layer_norm=True
-
-    # actor megatron MoE config
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True
-    "+actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=flex"
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_enable_deepep=True
 
     # actor optimizer
     actor_rollout_ref.actor.optim.lr=${actor_lr}

@@ -323,6 +323,16 @@ class TaskSyncAgentLoop(AgentLoopBase):
         )
         self.enable_ptc_default = self.ptc_mode != "no-ptc"
 
+        # tool_call_format selects how the inner of <tool_call>...</tool_call>
+        # (and bare top-level blobs) is parsed:
+        #   "auto" -- try XML <function=...>, fall back to JSON (default)
+        #   "xml"  -- Qwen3-Coder style only
+        #   "json" -- Hermes JSON only (Qwen3-8B); malformed -> log + drop
+        self.tool_call_format = env_cfg.get("tool_call_format", "auto")
+        assert self.tool_call_format in ("auto", "xml", "json"), (
+            f"tool_call_format must be 'auto', 'xml', or 'json', got '{self.tool_call_format}'"
+        )
+
         self.reward_type = env_cfg.get("reward_type", "dense")
         assert self.reward_type in ("dense", "binary"), (
             f"reward_type must be 'dense' or 'binary', got '{self.reward_type}'"
@@ -786,9 +796,54 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
 
     def _parse_tool_call(self, block: str) -> Optional[dict[str, Any]]:
         """Parse a single tool call from the contents of a <tool_call>...</tool_call>
-        block. Requires <function=NAME>...</function> to be properly closed, and
-        each <parameter=NAME>...</parameter> to be properly closed. Returns None
-        (dropping the entire call) on any malformed structure."""
+        block. Dispatches on self.tool_call_format:
+          - 'json': Hermes JSON only ({"name":..., "arguments":...}); malformed -> drop
+          - 'xml':  <function=NAME>...</function> with <parameter=NAME>...</parameter>
+          - 'auto': prefer XML if <function= present, else JSON
+        Returns None (dropping the entire call) on any malformed structure."""
+        fmt = getattr(self, "tool_call_format", "auto")
+        stripped = block.strip()
+
+        if fmt == "json":
+            return self._parse_tool_call_json(stripped)
+        if fmt == "xml":
+            return self._parse_tool_call_xml(block)
+        # auto
+        if "<function=" in block:
+            return self._parse_tool_call_xml(block)
+        if stripped.startswith("{"):
+            return self._parse_tool_call_json(stripped)
+        logger.warning("Tool call has neither <function=...> nor JSON object; dropping")
+        return None
+
+    def _parse_tool_call_json(self, blob: str) -> Optional[dict[str, Any]]:
+        """Parse Hermes-style JSON tool call: {"name": ..., "arguments": {...}}.
+        On any error, log and drop (return None) -- consistent with XML path."""
+        try:
+            obj = json.loads(blob)
+        except (json.JSONDecodeError, ValueError) as e:
+            preview = blob[:200].replace("\n", "\\n")
+            logger.error(f"tool_call_format=json: JSON parse failed ({e}); dropping. raw='{preview}'")
+            return None
+        if not isinstance(obj, dict) or "name" not in obj:
+            preview = blob[:200].replace("\n", "\\n")
+            logger.error(f"tool_call_format=json: missing 'name' field; dropping. raw='{preview}'")
+            return None
+        name = obj["name"]
+        if not isinstance(name, str) or not name:
+            logger.error(f"tool_call_format=json: invalid 'name' field; dropping. raw='{blob[:200]}'")
+            return None
+        args = obj.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        return {"name": name, "arguments": args}
+
+    def _parse_tool_call_xml(self, block: str) -> Optional[dict[str, Any]]:
         try:
             func_start = block.find("<function=")
             if func_start == -1:
