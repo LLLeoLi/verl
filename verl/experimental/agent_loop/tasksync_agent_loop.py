@@ -291,6 +291,7 @@ class TaskSyncAgentData:
         self.execute_python_count: int = 0
         self.terminal_count: int = 0
         self.env_tool_count: int = 0
+        self.tool_call_parse_error_count: int = 0
 
         self.current_tool_calls: list[dict[str, Any]] = []
 
@@ -591,10 +592,26 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
 
         agent_data.messages.append({"role": "assistant", "content": response_text})
 
-        tool_calls = self._parse_tool_calls(response_text)
+        tool_calls, parse_errors = self._parse_tool_calls(response_text)
         agent_data.current_tool_calls = tool_calls
 
         if not tool_calls:
+            if parse_errors:
+                # Tool-call format was inconsistent (e.g. malformed JSON, unclosed
+                # XML tag). Surface the error back to the model as a synthetic
+                # tool observation so it can self-correct, rather than dropping
+                # the whole trajectory's reward to 0.
+                agent_data.tool_call_parse_error_count += 1
+                error_text = (
+                    "Your previous message contained a malformed tool call and could "
+                    "not be parsed. Details:\n"
+                    + "\n".join(f"- {e}" for e in parse_errors)
+                )
+                agent_data.current_tool_calls = [{
+                    "name": "tool_call_parse_error",
+                    "arguments": {"_error": error_text},
+                }]
+                return AgentState.PROCESSING_TOOL
             return AgentState.TERMINATED
 
         return AgentState.PROCESSING_TOOL
@@ -652,6 +669,13 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         agent_data: TaskSyncAgentData,
         reward_type: str,
     ) -> tuple[str, float, bool]:
+        if tool_name == "tool_call_parse_error":
+            # Synthesised by _handle_generating_state when the model emitted a
+            # malformed tool call. Surface the parse error back as a tool
+            # observation so the model can self-correct on the next turn,
+            # instead of terminating with reward 0.
+            return arguments.get("_error", "Tool call could not be parsed."), 0.0, False
+
         if tool_name == "claim_done":
             action = arguments.get("action", "")
             try:
@@ -712,12 +736,20 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         observation, _is_valid, _has_error = env.execute_tool(tool_name, arguments)
         return observation, 0.0, False
 
-    def _parse_tool_calls(self, response: str) -> list[dict[str, Any]]:
+    def _parse_tool_calls(self, response: str) -> tuple[list[dict[str, Any]], list[str]]:
+        """Parse all tool calls in the response.
+
+        Returns (calls, errors). ``errors`` is non-empty when the response
+        *attempted* a tool call (had <tool_call> / <function=> / a JSON object
+        with a "name" key) but parsing failed somewhere. Callers can use this
+        signal to surface the error back to the model instead of silently
+        terminating the rollout with reward 0.
+        """
         calls: list[dict[str, Any]] = []
+        errors: list[str] = []
 
         # XML-style: strict format -- requires <tool_call>...</tool_call> wrapper,
-        # with a properly closed <function=NAME>...</function> inside. Malformed
-        # blocks are dropped entirely.
+        # with a properly closed <function=NAME>...</function> inside.
         open_tag = "<tool_call>"
         close_tag = "</tool_call>"
         if open_tag in response:
@@ -728,14 +760,16 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
                     break
                 end = response.find(close_tag, start + len(open_tag))
                 if end == -1:
-                    logger.warning("Unclosed <tool_call> wrapper; dropping call")
+                    msg = "Unclosed <tool_call> wrapper (missing </tool_call>)"
+                    logger.warning(msg + "; dropping call")
+                    errors.append(msg)
                     break
                 inner = response[start + len(open_tag) : end]
-                parsed = self._parse_tool_call(inner)
+                parsed = self._parse_tool_call(inner, errors)
                 if parsed is not None:
                     calls.append(parsed)
                 idx = end + len(close_tag)
-            return calls
+            return calls, errors
 
         # JSON-style: scan for all top-level {...} blocks containing a "name" field.
         pos = 0
@@ -745,28 +779,42 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
                 break
             end = self._find_balanced_brace(response, start)
             if end == -1:
+                if '"name"' in response[start:]:
+                    errors.append(
+                        "Unbalanced braces in JSON tool call (could not find matching '}')."
+                    )
                 break
             blob = response[start : end + 1]
             parsed: Optional[dict[str, Any]] = None
             if '"name"' in blob:
                 try:
                     tc = json.loads(blob)
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError) as e:
                     tc = None
+                    errors.append(
+                        f"JSON tool call failed to parse: {e}. "
+                        f"Snippet: {blob[:200].replace(chr(10), ' ')}"
+                    )
                 if isinstance(tc, dict) and "name" in tc:
                     args = tc.get("arguments", {})
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
-                        except (json.JSONDecodeError, ValueError):
+                        except (json.JSONDecodeError, ValueError) as e:
+                            errors.append(
+                                f"'arguments' for tool '{tc['name']}' was a string but "
+                                f"not valid JSON: {e}"
+                            )
                             args = {}
                     parsed = {"name": tc["name"], "arguments": args}
+                elif isinstance(tc, dict):
+                    errors.append("JSON tool call missing required 'name' field.")
             if parsed is not None:
                 calls.append(parsed)
                 pos = end + 1
             else:
                 pos = start + 1
-        return calls
+        return calls, errors
 
     @staticmethod
     def _find_balanced_brace(s: str, start: int) -> int:
@@ -794,76 +842,97 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
                     return j
         return -1
 
-    def _parse_tool_call(self, block: str) -> Optional[dict[str, Any]]:
+    def _parse_tool_call(
+        self, block: str, errors: list[str]
+    ) -> Optional[dict[str, Any]]:
         """Parse a single tool call from the contents of a <tool_call>...</tool_call>
-        block. Dispatches on self.tool_call_format:
-          - 'json': Hermes JSON only ({"name":..., "arguments":...}); malformed -> drop
-          - 'xml':  <function=NAME>...</function> with <parameter=NAME>...</parameter>
-          - 'auto': prefer XML if <function= present, else JSON
-        Returns None (dropping the entire call) on any malformed structure."""
+        block. Dispatches on self.tool_call_format. Appends a descriptive message
+        to ``errors`` on failure so the caller can surface it to the model."""
         fmt = getattr(self, "tool_call_format", "auto")
         stripped = block.strip()
 
         if fmt == "json":
-            return self._parse_tool_call_json(stripped)
+            return self._parse_tool_call_json(stripped, errors)
         if fmt == "xml":
-            return self._parse_tool_call_xml(block)
+            return self._parse_tool_call_xml(block, errors)
         # auto
         if "<function=" in block:
-            return self._parse_tool_call_xml(block)
+            return self._parse_tool_call_xml(block, errors)
         if stripped.startswith("{"):
-            return self._parse_tool_call_json(stripped)
-        logger.warning("Tool call has neither <function=...> nor JSON object; dropping")
+            return self._parse_tool_call_json(stripped, errors)
+        msg = "Tool call inside <tool_call> has neither <function=...> nor a JSON object."
+        logger.warning(msg + " Dropping.")
+        errors.append(msg)
         return None
 
-    def _parse_tool_call_json(self, blob: str) -> Optional[dict[str, Any]]:
-        """Parse Hermes-style JSON tool call: {"name": ..., "arguments": {...}}.
-        On any error, log and drop (return None) -- consistent with XML path."""
+    def _parse_tool_call_json(
+        self, blob: str, errors: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Parse Hermes-style JSON tool call: {"name": ..., "arguments": {...}}."""
         try:
             obj = json.loads(blob)
         except (json.JSONDecodeError, ValueError) as e:
             preview = blob[:200].replace("\n", "\\n")
             logger.error(f"tool_call_format=json: JSON parse failed ({e}); dropping. raw='{preview}'")
+            errors.append(f"JSON parse failed: {e}. Snippet: {preview}")
             return None
         if not isinstance(obj, dict) or "name" not in obj:
             preview = blob[:200].replace("\n", "\\n")
             logger.error(f"tool_call_format=json: missing 'name' field; dropping. raw='{preview}'")
+            errors.append("JSON tool call missing required 'name' field.")
             return None
         name = obj["name"]
         if not isinstance(name, str) or not name:
             logger.error(f"tool_call_format=json: invalid 'name' field; dropping. raw='{blob[:200]}'")
+            errors.append("JSON tool call 'name' field is empty or not a string.")
             return None
         args = obj.get("arguments", {})
         if isinstance(args, str):
             try:
                 args = json.loads(args)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError) as e:
+                errors.append(
+                    f"'arguments' for tool '{name}' was a string but not valid JSON: {e}"
+                )
                 args = {}
         if not isinstance(args, dict):
+            errors.append(
+                f"'arguments' for tool '{name}' must be a JSON object, got {type(args).__name__}."
+            )
             args = {}
         return {"name": name, "arguments": args}
 
-    def _parse_tool_call_xml(self, block: str) -> Optional[dict[str, Any]]:
+    def _parse_tool_call_xml(
+        self, block: str, errors: list[str]
+    ) -> Optional[dict[str, Any]]:
         try:
             func_start = block.find("<function=")
             if func_start == -1:
-                logger.warning("Tool call missing <function=...>; dropping")
+                msg = "Tool call missing <function=...> tag."
+                logger.warning(msg + " Dropping.")
+                errors.append(msg)
                 return None
 
             func_part = block[func_start + len("<function=") :]
             name_end = func_part.find(">")
             if name_end == -1:
-                logger.warning("Malformed <function=...> tag; dropping")
+                msg = "Malformed <function=...> tag (missing '>')."
+                logger.warning(msg + " Dropping.")
+                errors.append(msg)
                 return None
             func_name = func_part[:name_end].strip()
             if not func_name:
-                logger.warning("Empty function name; dropping")
+                msg = "Empty function name in <function=...> tag."
+                logger.warning(msg + " Dropping.")
+                errors.append(msg)
                 return None
 
             remaining = func_part[name_end + 1 :]
             close_idx = remaining.find("</function>")
             if close_idx == -1:
-                logger.warning(f"Tool call '{func_name}' missing </function>; dropping")
+                msg = f"Tool call '{func_name}' missing </function> closing tag."
+                logger.warning(msg + " Dropping.")
+                errors.append(msg)
                 return None
             params_block = remaining[:close_idx]
 
@@ -873,21 +942,25 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
                 for param in params[1:]:
                     pname_end = param.find(">")
                     if pname_end == -1:
-                        logger.warning(
-                            f"Malformed <parameter=...> in '{func_name}'; dropping call"
-                        )
+                        msg = f"Malformed <parameter=...> in '{func_name}' (missing '>')."
+                        logger.warning(msg + " Dropping call.")
+                        errors.append(msg)
                         return None
                     param_name = param[:pname_end].strip()
                     if not param_name:
-                        logger.warning(f"Empty parameter name in '{func_name}'; dropping call")
+                        msg = f"Empty parameter name in '{func_name}'."
+                        logger.warning(msg + " Dropping call.")
+                        errors.append(msg)
                         return None
                     after = param[pname_end + 1 :]
                     pclose_idx = after.find("</parameter>")
                     if pclose_idx == -1:
-                        logger.warning(
+                        msg = (
                             f"Parameter '{param_name}' in '{func_name}' missing "
-                            f"</parameter>; dropping call"
+                            f"</parameter> closing tag."
                         )
+                        logger.warning(msg + " Dropping call.")
+                        errors.append(msg)
                         return None
                     param_value_raw = after[:pclose_idx].strip()
                     arguments[param_name] = self._parse_param_value(param_value_raw)
@@ -895,6 +968,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             return {"name": func_name, "arguments": arguments}
         except Exception as e:
             logger.warning(f"Error parsing tool call: {e}")
+            errors.append(f"Unexpected error parsing XML tool call: {e}")
             return None
 
     def _parse_param_value(self, param_value_raw: str) -> Any:
@@ -987,6 +1061,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             "execute_python_count": agent_data.execute_python_count,
             "terminal_count": agent_data.terminal_count,
             "env_tool_count": agent_data.env_tool_count,
+            "tool_call_parse_error_count": agent_data.tool_call_parse_error_count,
         }
         output.extra_fields["messages"] = agent_data.messages
 
@@ -1024,6 +1099,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
                     "execute_python_count": 0,
                     "terminal_count": 0,
                     "env_tool_count": 0,
+                    "tool_call_parse_error_count": 0,
                 },
                 "messages": [],
             },
