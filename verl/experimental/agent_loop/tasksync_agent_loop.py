@@ -44,6 +44,10 @@ from uuid import uuid4
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
 from verl.experimental.agent_loop.landlock_sandbox import StatefulSandbox
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
+from verl.experimental.agent_loop.vllm_tool_parsers import (
+    parse_hermes,
+    parse_qwen3coder,
+)
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -592,7 +596,9 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
 
         agent_data.messages.append({"role": "assistant", "content": response_text})
 
-        tool_calls, parse_errors = self._parse_tool_calls(response_text)
+        tool_calls, parse_errors = self._parse_tool_calls(
+            response_text, agent_data.tool_schemas
+        )
         agent_data.current_tool_calls = tool_calls
 
         if not tool_calls:
@@ -736,262 +742,44 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         observation, _is_valid, _has_error = env.execute_tool(tool_name, arguments)
         return observation, 0.0, False
 
-    def _parse_tool_calls(self, response: str) -> tuple[list[dict[str, Any]], list[str]]:
-        """Parse all tool calls in the response.
+    def _parse_tool_calls(
+        self,
+        response: str,
+        tool_schemas: Optional[list[dict[str, Any]]] = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Extract tool calls from a model response, mirroring vLLM exactly.
 
-        Returns (calls, errors). ``errors`` is non-empty when the response
-        *attempted* a tool call (had <tool_call> / <function=> / a JSON object
-        with a "name" key) but parsing failed somewhere. Callers can use this
-        signal to surface the error back to the model instead of silently
-        terminating the rollout with reward 0.
+        Dispatches on ``self.tool_call_format``:
+          * ``json``  -> ``vllm.tool_parsers.Hermes2ProToolParser`` (Qwen3)
+          * ``xml``   -> ``vllm.tool_parsers.Qwen3CoderToolParser`` (Qwen3-Coder)
+          * ``auto``  -> Hermes if ``<tool_call>`` present, else Qwen3Coder
+                         (which has its own ``<function=`` back-off)
+
+        Returns ``(calls, errors)``. ``errors`` is non-empty when the model
+        attempted a tool call but the parse failed at vLLM's strictness level.
+        The caller surfaces those errors back to the model so it can self-
+        correct, even though vLLM at serve time would just drop the calls --
+        this keeps the trained policy aware of format mistakes instead of
+        silently zeroing the reward.
         """
-        calls: list[dict[str, Any]] = []
-        errors: list[str] = []
-
-        # XML-style: strict format -- requires <tool_call>...</tool_call> wrapper,
-        # with a properly closed <function=NAME>...</function> inside.
-        open_tag = "<tool_call>"
-        close_tag = "</tool_call>"
-        if open_tag in response:
-            idx = 0
-            while True:
-                start = response.find(open_tag, idx)
-                if start == -1:
-                    break
-                end = response.find(close_tag, start + len(open_tag))
-                if end == -1:
-                    msg = "Unclosed <tool_call> wrapper (missing </tool_call>)"
-                    logger.warning(msg + "; dropping call")
-                    errors.append(msg)
-                    break
-                inner = response[start + len(open_tag) : end]
-                parsed = self._parse_tool_call(inner, errors)
-                if parsed is not None:
-                    calls.append(parsed)
-                idx = end + len(close_tag)
-            return calls, errors
-
-        # JSON-style: scan for all top-level {...} blocks containing a "name" field.
-        pos = 0
-        while pos < len(response):
-            start = response.find("{", pos)
-            if start == -1:
-                break
-            end = self._find_balanced_brace(response, start)
-            if end == -1:
-                if '"name"' in response[start:]:
-                    errors.append(
-                        "Unbalanced braces in JSON tool call (could not find matching '}')."
-                    )
-                break
-            blob = response[start : end + 1]
-            parsed: Optional[dict[str, Any]] = None
-            if '"name"' in blob:
-                try:
-                    tc = json.loads(blob)
-                except (json.JSONDecodeError, ValueError) as e:
-                    tc = None
-                    errors.append(
-                        f"JSON tool call failed to parse: {e}. "
-                        f"Snippet: {blob[:200].replace(chr(10), ' ')}"
-                    )
-                if isinstance(tc, dict) and "name" in tc:
-                    args = tc.get("arguments", {})
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except (json.JSONDecodeError, ValueError) as e:
-                            errors.append(
-                                f"'arguments' for tool '{tc['name']}' was a string but "
-                                f"not valid JSON: {e}"
-                            )
-                            args = {}
-                    parsed = {"name": tc["name"], "arguments": args}
-                elif isinstance(tc, dict):
-                    errors.append("JSON tool call missing required 'name' field.")
-            if parsed is not None:
-                calls.append(parsed)
-                pos = end + 1
-            else:
-                pos = start + 1
-        return calls, errors
-
-    @staticmethod
-    def _find_balanced_brace(s: str, start: int) -> int:
-        """Return index of `}` that closes `s[start]` (which must be `{`),
-        respecting string literals. Returns -1 if unbalanced."""
-        depth = 0
-        in_str = False
-        esc = False
-        for j in range(start, len(s)):
-            c = s[j]
-            if in_str:
-                if esc:
-                    esc = False
-                elif c == "\\":
-                    esc = True
-                elif c == '"':
-                    in_str = False
-            elif c == '"':
-                in_str = True
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    return j
-        return -1
-
-    def _parse_tool_call(
-        self, block: str, errors: list[str]
-    ) -> Optional[dict[str, Any]]:
-        """Parse a single tool call from the contents of a <tool_call>...</tool_call>
-        block. Dispatches on self.tool_call_format. Appends a descriptive message
-        to ``errors`` on failure so the caller can surface it to the model."""
         fmt = getattr(self, "tool_call_format", "auto")
-        stripped = block.strip()
 
         if fmt == "json":
-            return self._parse_tool_call_json(stripped, errors)
+            calls, _content, errors = parse_hermes(response)
+            return calls, errors
         if fmt == "xml":
-            return self._parse_tool_call_xml(block, errors)
+            calls, _content, errors = parse_qwen3coder(response, tool_schemas)
+            return calls, errors
         # auto
-        if "<function=" in block:
-            return self._parse_tool_call_xml(block, errors)
-        if stripped.startswith("{"):
-            return self._parse_tool_call_json(stripped, errors)
-        msg = "Tool call inside <tool_call> has neither <function=...> nor a JSON object."
-        logger.warning(msg + " Dropping.")
-        errors.append(msg)
-        return None
-
-    def _parse_tool_call_json(
-        self, blob: str, errors: list[str]
-    ) -> Optional[dict[str, Any]]:
-        """Parse Hermes-style JSON tool call: {"name": ..., "arguments": {...}}."""
-        try:
-            obj = json.loads(blob)
-        except (json.JSONDecodeError, ValueError) as e:
-            preview = blob[:200].replace("\n", "\\n")
-            logger.error(f"tool_call_format=json: JSON parse failed ({e}); dropping. raw='{preview}'")
-            errors.append(f"JSON parse failed: {e}. Snippet: {preview}")
-            return None
-        if not isinstance(obj, dict) or "name" not in obj:
-            preview = blob[:200].replace("\n", "\\n")
-            logger.error(f"tool_call_format=json: missing 'name' field; dropping. raw='{preview}'")
-            errors.append("JSON tool call missing required 'name' field.")
-            return None
-        name = obj["name"]
-        if not isinstance(name, str) or not name:
-            logger.error(f"tool_call_format=json: invalid 'name' field; dropping. raw='{blob[:200]}'")
-            errors.append("JSON tool call 'name' field is empty or not a string.")
-            return None
-        args = obj.get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except (json.JSONDecodeError, ValueError) as e:
-                errors.append(
-                    f"'arguments' for tool '{name}' was a string but not valid JSON: {e}"
-                )
-                args = {}
-        if not isinstance(args, dict):
-            errors.append(
-                f"'arguments' for tool '{name}' must be a JSON object, got {type(args).__name__}."
-            )
-            args = {}
-        return {"name": name, "arguments": args}
-
-    def _parse_tool_call_xml(
-        self, block: str, errors: list[str]
-    ) -> Optional[dict[str, Any]]:
-        try:
-            func_start = block.find("<function=")
-            if func_start == -1:
-                msg = "Tool call missing <function=...> tag."
-                logger.warning(msg + " Dropping.")
-                errors.append(msg)
-                return None
-
-            func_part = block[func_start + len("<function=") :]
-            name_end = func_part.find(">")
-            if name_end == -1:
-                msg = "Malformed <function=...> tag (missing '>')."
-                logger.warning(msg + " Dropping.")
-                errors.append(msg)
-                return None
-            func_name = func_part[:name_end].strip()
-            if not func_name:
-                msg = "Empty function name in <function=...> tag."
-                logger.warning(msg + " Dropping.")
-                errors.append(msg)
-                return None
-
-            remaining = func_part[name_end + 1 :]
-            close_idx = remaining.find("</function>")
-            if close_idx == -1:
-                msg = f"Tool call '{func_name}' missing </function> closing tag."
-                logger.warning(msg + " Dropping.")
-                errors.append(msg)
-                return None
-            params_block = remaining[:close_idx]
-
-            arguments: dict[str, Any] = {}
-            if "<parameter=" in params_block:
-                params = params_block.split("<parameter=")
-                for param in params[1:]:
-                    pname_end = param.find(">")
-                    if pname_end == -1:
-                        msg = f"Malformed <parameter=...> in '{func_name}' (missing '>')."
-                        logger.warning(msg + " Dropping call.")
-                        errors.append(msg)
-                        return None
-                    param_name = param[:pname_end].strip()
-                    if not param_name:
-                        msg = f"Empty parameter name in '{func_name}'."
-                        logger.warning(msg + " Dropping call.")
-                        errors.append(msg)
-                        return None
-                    after = param[pname_end + 1 :]
-                    pclose_idx = after.find("</parameter>")
-                    if pclose_idx == -1:
-                        msg = (
-                            f"Parameter '{param_name}' in '{func_name}' missing "
-                            f"</parameter> closing tag."
-                        )
-                        logger.warning(msg + " Dropping call.")
-                        errors.append(msg)
-                        return None
-                    param_value_raw = after[:pclose_idx].strip()
-                    arguments[param_name] = self._parse_param_value(param_value_raw)
-
-            return {"name": func_name, "arguments": arguments}
-        except Exception as e:
-            logger.warning(f"Error parsing tool call: {e}")
-            errors.append(f"Unexpected error parsing XML tool call: {e}")
-            return None
-
-    def _parse_param_value(self, param_value_raw: str) -> Any:
-        if not param_value_raw:
-            return param_value_raw
-
-        if param_value_raw.lower() in {"true", "false"}:
-            return param_value_raw.lower() == "true"
-
-        try:
-            if "." in param_value_raw:
-                return float(param_value_raw)
-            else:
-                return int(param_value_raw)
-        except (ValueError, TypeError):
-            pass
-
-        try:
-            return json.loads(param_value_raw)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        return param_value_raw
+        if "<tool_call>" in response:
+            calls, _content, errors = parse_hermes(response)
+            if calls or errors:
+                return calls, errors
+            # Hermes saw the wrapper but couldn't extract anything -- maybe the
+            # model used the qwen3-coder XML form inside <tool_call>. Fall
+            # through to qwen3coder which handles both layouts.
+        calls, _content, errors = parse_qwen3coder(response, tool_schemas)
+        return calls, errors
 
     def _build_output(self, agent_data: TaskSyncAgentData) -> AgentLoopOutput:
         response_ids = (
