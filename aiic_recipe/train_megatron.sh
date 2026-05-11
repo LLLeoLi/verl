@@ -143,7 +143,7 @@ case "${ptc_mode}" in
     ptc|no-ptc|mixed) ;;
     *) echo "ERROR: --ptc_mode must be 'ptc', 'no-ptc', or 'mixed' (got '${ptc_mode}')" >&2; exit 1 ;;
 esac
-ptc_error_penalty=${ptc_error_penalty:-0.00}
+ptc_error_penalty=${ptc_error_penalty:-0.01}
 dense_epoch=${dense_epoch:-0}
 val_ratio=${val_ratio:-0.0}
 test_freq=${test_freq:--1}
