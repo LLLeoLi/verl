@@ -23,13 +23,24 @@ logger = logging.getLogger(__file__)
 
 def get_max_position_embeddings(hf_config) -> int:
     max_len = getattr(hf_config, "max_position_embeddings", None)
+    rope_scaling = getattr(hf_config, "rope_scaling", None)
     if max_len is None:
         text_config = getattr(hf_config, "text_config", None)
         if text_config is not None:
             max_len = getattr(text_config, "max_position_embeddings", None)
+            if rope_scaling is None:
+                rope_scaling = getattr(text_config, "rope_scaling", None)
 
     if max_len is None:
         raise ValueError("max_position_embeddings not found in HFModelConfig!")
+
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+        factor = rope_scaling.get("factor")
+        if rope_type in ("yarn", "linear", "dynamic", "longrope") and factor:
+            original = rope_scaling.get("original_max_position_embeddings", max_len)
+            max_len = max(int(max_len), int(original * factor))
+
     return int(max_len)
 
 
