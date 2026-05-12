@@ -596,22 +596,14 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         agent_data.current_tool_calls = tool_calls
 
         if not tool_calls:
+            # Strict mode (restored from the pre-2026-05-12 behaviour): any
+            # rollout that fails to produce a parseable tool call -- whether
+            # because the model emitted plain text or because the format was
+            # malformed -- terminates immediately. Since claim_done was never
+            # called, agent_data.final_reward stays at 0. parse_errors is
+            # still bumped into a metric so the rate is observable.
             if parse_errors:
-                # Tool-call format was inconsistent (e.g. malformed JSON, unclosed
-                # XML tag). Surface the error back to the model as a synthetic
-                # tool observation so it can self-correct, rather than dropping
-                # the whole trajectory's reward to 0.
                 agent_data.tool_call_parse_error_count += 1
-                error_text = (
-                    "Your previous message contained a malformed tool call and could "
-                    "not be parsed. Details:\n"
-                    + "\n".join(f"- {e}" for e in parse_errors)
-                )
-                agent_data.current_tool_calls = [{
-                    "name": "tool_call_parse_error",
-                    "arguments": {"_error": error_text},
-                }]
-                return AgentState.PROCESSING_TOOL
             return AgentState.TERMINATED
 
         return AgentState.PROCESSING_TOOL
