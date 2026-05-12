@@ -599,6 +599,32 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         tool_calls, parse_errors = self._parse_tool_calls(
             response_text, agent_data.tool_schemas
         )
+
+        # vLLM's parsers preserve ``arguments`` as whatever JSON value the model
+        # emitted (list / scalar / null included), and ``name`` as whatever
+        # type was supplied. The agent loop downstream uses ``arguments.get``
+        # and ``**arguments``, so anything other than (str name, dict args) is
+        # unworkable and would crash the rollout worker. Treat such calls as
+        # parse errors so they go through the re-prompt path -- the parser
+        # itself stays byte-identical to vLLM.
+        validated: list[dict[str, Any]] = []
+        for tc in tool_calls:
+            name = tc.get("name")
+            args = tc.get("arguments")
+            if not isinstance(name, str) or not name:
+                parse_errors.append(
+                    f"Tool call 'name' must be a non-empty string, got "
+                    f"{type(name).__name__}: {name!r}."
+                )
+                continue
+            if not isinstance(args, dict):
+                parse_errors.append(
+                    f"Tool call 'arguments' for '{name}' must be a JSON object, "
+                    f"got {type(args).__name__}: {str(args)[:120]}."
+                )
+                continue
+            validated.append({"name": name, "arguments": args})
+        tool_calls = validated
         agent_data.current_tool_calls = tool_calls
 
         if not tool_calls:
