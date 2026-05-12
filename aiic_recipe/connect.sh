@@ -16,6 +16,13 @@ CONFIG_PATH="$SSH_DIR/config"
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
+# --- Step 0: 清理空的密钥文件 ---
+if [ -f "$KEY_PATH" ] && [ ! -s "$KEY_PATH" ]; then
+    echo "🧹 检测到空的 RSA 密钥文件，正在删除..."
+    rm -f "$KEY_PATH" "${KEY_PATH}.pub"
+    echo "✅ 空密钥文件已清理。"
+fi
+
 # --- Step 1: 生成 RSA 密钥 ---
 if [ -f "$KEY_PATH" ]; then
     echo "⚠️  RSA 密钥已存在: $KEY_PATH，跳过生成。"
