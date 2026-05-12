@@ -59,6 +59,12 @@ class TerminalExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                # Shell tools (file/grep on binaries, locale-mismatched output,
+                # etc.) routinely emit non-UTF-8 bytes. Without ``replace`` the
+                # default strict decoder raises UnicodeDecodeError inside
+                # ``_translate_newlines`` and crashes the rollout worker.
+                errors="replace",
                 start_new_session=True,
                 preexec_fn=_preexec,
             )
