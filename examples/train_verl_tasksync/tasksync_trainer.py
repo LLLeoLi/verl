@@ -528,6 +528,7 @@ class TaskSyncTrainer(RayPPOTrainer):
                     mean_python_count = _mean_of("execute_python_count")
                     mean_terminal_count = _mean_of("terminal_count")
                     mean_env_tool_count = _mean_of("env_tool_count")
+                    mean_tool_call_parse_error_count = _mean_of("tool_call_parse_error_count")
 
                     logger.info(
                         f"Group statistics: total={total_groups}, "
@@ -536,7 +537,8 @@ class TaskSyncTrainer(RayPPOTrainer):
                         f"mean_ptc={mean_ptc_count:.2f}, mean_ptc_err={mean_ptc_error_count:.2f}, "
                         f"mean_ptc_penalty={mean_ptc_error_penalty:.4f}, "
                         f"mean_py={mean_python_count:.2f}, "
-                        f"mean_term={mean_terminal_count:.2f}, mean_env_tool={mean_env_tool_count:.2f}"
+                        f"mean_term={mean_terminal_count:.2f}, mean_env_tool={mean_env_tool_count:.2f}, "
+                        f"mean_parse_err={mean_tool_call_parse_error_count:.2f}"
                     )
 
                     metrics.update({
@@ -549,6 +551,7 @@ class TaskSyncTrainer(RayPPOTrainer):
                         "group_status/mean_python_count": mean_python_count,
                         "group_status/mean_terminal_count": mean_terminal_count,
                         "group_status/mean_env_tool_count": mean_env_tool_count,
+                        "group_status/mean_tool_call_parse_error_count": mean_tool_call_parse_error_count,
                         "reward/mean_ptc_error_penalty": mean_ptc_error_penalty,
                     })
 

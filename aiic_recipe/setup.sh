@@ -34,8 +34,35 @@ sudo python3 -m pip install protobuf==4.25.3 --break-system-packages
 
 git submodule update --init task-sync
 
-hdfs dfs -get hdfs://harunava/home/byte_malia_gcp_aiic/user/codeai/hf_models/Qwen3-Coder-30B-A3B-Instruct /opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct
-echo "Downloaded Qwen3-Coder-30B-A3B-Instruct"
+# Pick which model to download. Defaults to Qwen3-Coder-30B-A3B-Instruct;
+# pass `--model qwen3_5_9b` to fetch Qwen3.5-9B instead.
+MODEL_CHOICE="qwen3_coder_30b"
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model) MODEL_CHOICE="$2"; shift 2 ;;
+        *) ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${ARGS[@]}"
+
+case "${MODEL_CHOICE}" in
+    qwen3_coder_30b)
+        HDFS_MODEL_PATH="hdfs://harunava/home/byte_malia_gcp_aiic/user/codeai/hf_models/Qwen3-Coder-30B-A3B-Instruct"
+        LOCAL_MODEL_PATH="/opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct"
+        ;;
+    qwen3_5_9b)
+        HDFS_MODEL_PATH="hdfs://harunava/home/byte_malia_gcp_aiic/user/codeai/hf_models/Qwen3.5-9B"
+        LOCAL_MODEL_PATH="/opt/tiger/entry/Qwen3.5-9B"
+        ;;
+    *)
+        echo "ERROR: unknown --model '${MODEL_CHOICE}' (expected qwen3_coder_30b | qwen3_5_9b)" >&2
+        exit 1
+        ;;
+esac
+
+hdfs dfs -get "${HDFS_MODEL_PATH}" "${LOCAL_MODEL_PATH}"
+echo "Downloaded $(basename "${LOCAL_MODEL_PATH}")"
 
 # NOTE: offline HF -> mcore conversion is no longer required. train_megatron.sh
 # now defaults to use_dist_checkpointing=False, which lets mbridge load the HF
@@ -43,10 +70,10 @@ echo "Downloaded Qwen3-Coder-30B-A3B-Instruct"
 # legacy dist-checkpoint path (and must also run with
 # --use_dist_checkpointing True).
 if [ "${1:-}" = "--mcore" ]; then
-    echo "Converting Qwen3-Coder-30B-A3B-Instruct to mcore format"
+    echo "Converting $(basename "${LOCAL_MODEL_PATH}") to mcore format"
     python scripts/converter_hf_to_mcore.py \
-        --hf_model_path /opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct \
-        --output_path /opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct-mcore \
+        --hf_model_path "${LOCAL_MODEL_PATH}" \
+        --output_path "${LOCAL_MODEL_PATH}-mcore" \
         --trust_remote_code
-    echo "Converted Qwen3-Coder-30B-A3B-Instruct to mcore format"
+    echo "Converted $(basename "${LOCAL_MODEL_PATH}") to mcore format"
 fi
