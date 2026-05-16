@@ -34,9 +34,10 @@ sudo python3 -m pip install protobuf==4.25.3 --break-system-packages
 
 git submodule update --init task-sync
 
-# Pick which model to download. Defaults to Qwen3-Coder-30B-A3B-Instruct;
-# pass `--model qwen3_5_9b` to fetch Qwen3.5-9B instead.
-MODEL_CHOICE="qwen3_coder_30b"
+# Optionally download a model. No download happens unless `--model` is passed.
+#   --model qwen3_coder_30b -> Qwen3-Coder-30B-A3B-Instruct
+#   --model qwen3_5_9b      -> Qwen3.5-9B
+MODEL_CHOICE=""
 ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -46,23 +47,27 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${ARGS[@]}"
 
-case "${MODEL_CHOICE}" in
-    qwen3_coder_30b)
-        HDFS_MODEL_PATH="hdfs://harunava/home/byte_malia_gcp_aiic/user/codeai/hf_models/Qwen3-Coder-30B-A3B-Instruct"
-        LOCAL_MODEL_PATH="/opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct"
-        ;;
-    qwen3_5_9b)
-        HDFS_MODEL_PATH="hdfs://harunava/home/byte_malia_gcp_aiic/user/codeai/hf_models/Qwen3.5-9B"
-        LOCAL_MODEL_PATH="/opt/tiger/entry/Qwen3.5-9B"
-        ;;
-    *)
-        echo "ERROR: unknown --model '${MODEL_CHOICE}' (expected qwen3_coder_30b | qwen3_5_9b)" >&2
-        exit 1
-        ;;
-esac
-
-hdfs dfs -get "${HDFS_MODEL_PATH}" "${LOCAL_MODEL_PATH}"
-echo "Downloaded $(basename "${LOCAL_MODEL_PATH}")"
+LOCAL_MODEL_PATH=""
+if [ -n "${MODEL_CHOICE}" ]; then
+    case "${MODEL_CHOICE}" in
+        qwen3_coder_30b)
+            HDFS_MODEL_PATH="hdfs://harunava/home/byte_malia_gcp_aiic/user/codeai/hf_models/Qwen3-Coder-30B-A3B-Instruct"
+            LOCAL_MODEL_PATH="/opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct"
+            ;;
+        qwen3_5_9b)
+            HDFS_MODEL_PATH="hdfs://harunava/home/byte_malia_gcp_aiic/user/codeai/hf_models/Qwen3.5-9B"
+            LOCAL_MODEL_PATH="/opt/tiger/entry/Qwen3.5-9B"
+            ;;
+        *)
+            echo "ERROR: unknown --model '${MODEL_CHOICE}' (expected qwen3_coder_30b | qwen3_5_9b)" >&2
+            exit 1
+            ;;
+    esac
+    hdfs dfs -get "${HDFS_MODEL_PATH}" "${LOCAL_MODEL_PATH}"
+    echo "Downloaded $(basename "${LOCAL_MODEL_PATH}")"
+else
+    echo "No --model specified; skipping model download."
+fi
 
 # NOTE: offline HF -> mcore conversion is no longer required. train_megatron.sh
 # now defaults to use_dist_checkpointing=False, which lets mbridge load the HF
@@ -70,6 +75,10 @@ echo "Downloaded $(basename "${LOCAL_MODEL_PATH}")"
 # legacy dist-checkpoint path (and must also run with
 # --use_dist_checkpointing True).
 if [ "${1:-}" = "--mcore" ]; then
+    if [ -z "${LOCAL_MODEL_PATH}" ]; then
+        echo "ERROR: --mcore requires --model <choice> so a model is downloaded first." >&2
+        exit 1
+    fi
     echo "Converting $(basename "${LOCAL_MODEL_PATH}") to mcore format"
     python scripts/converter_hf_to_mcore.py \
         --hf_model_path "${LOCAL_MODEL_PATH}" \
