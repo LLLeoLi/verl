@@ -163,7 +163,7 @@ TRAIN_CMD=(
 
     # model & data
     actor_rollout_ref.model.path=${model_path}
-    actor_rollout_ref.model.use_remove_padding=True
+    actor_rollout_ref.model.use_remove_padding=False
     actor_rollout_ref.model.enable_gradient_checkpointing=True
     actor_rollout_ref.env.tasks_dir=${data_dir}
     actor_rollout_ref.env.batch_size=${env_batch_size}
@@ -187,14 +187,14 @@ TRAIN_CMD=(
     actor_rollout_ref.rollout.agent.num_workers=${num_workers}
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${ppo_micro_bsz_per_gpu}
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${max_token_len_per_gpu}
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False
     actor_rollout_ref.rollout.free_cache_engine=${offload}
     actor_rollout_ref.dump_experience_every=${dump_experience_every}
 
     # actor training
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_bsz}
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_bsz_per_gpu}
-    actor_rollout_ref.actor.use_dynamic_bsz=True
+    actor_rollout_ref.actor.use_dynamic_bsz=False
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${max_token_len_per_gpu}
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high}
     actor_rollout_ref.actor.policy_loss.loss_mode="${loss_mode}"
