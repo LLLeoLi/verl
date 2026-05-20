@@ -216,7 +216,7 @@ TRAIN_CMD=(
     actor_rollout_ref.actor.megatron.context_parallel_size=${actor_cp}
 
     # actor megatron fused kernels (dense-safe)
-    +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True
+    +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=False
     +actor_rollout_ref.actor.megatron.override_transformer_config.masked_softmax_fusion=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.bias_activation_fusion=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.bias_dropout_fusion=True
