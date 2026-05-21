@@ -17,6 +17,16 @@ sudo python3 -m pip install aiohttp --break-system-packages
 sudo python3 -m pip install --upgrade jupyter_client ipykernel --break-system-packages
 sudo python3 -m pip install faker --break-system-packages
 
+# Override the image-baked megatron-core 0.18.0 with an upstream commit that
+# includes NVIDIA/Megatron-LM#2645 (GDN packed-sequence / CP support), required
+# for running Qwen3.5 Gated Delta Net with context_parallel_size > 1.
+# Merge commit: 2d1fa8d372a3990b0bb1334cd686f15005ee138f (2026-05-14)
+MEGATRON_COMMIT="2d1fa8d372a3990b0bb1334cd686f15005ee138f"
+sudo python3 -m pip uninstall -y megatron-core --break-system-packages || true
+sudo python3 -m pip install --no-deps --break-system-packages \
+    "git+https://github.com/NVIDIA/Megatron-LM.git@${MEGATRON_COMMIT}"
+python3 -c "import megatron.core as m; print('megatron-core:', m.__version__, m.__file__)"
+
 # Deps required by task-sync + mbridge HF loading path:
 #   mcore-bridge          - needed when train_megatron.sh uses mbridge to load HF weights directly
 #   flash-linear-attention - required by Qwen3.5 Gated Delta Net linear attention
