@@ -37,14 +37,17 @@ sudo python3 -m pip uninstall byted-wandb wandb -y --break-system-packages || tr
 sudo python3 -m pip install wandb==0.16.6 --break-system-packages
 sudo python3 -m pip install protobuf==4.25.3 --break-system-packages
 
-# Override the image-baked megatron-core 0.18.0 with an upstream commit that
-# includes NVIDIA/Megatron-LM#2645 (GDN packed-sequence / CP support), required
-# for running Qwen3.5 Gated Delta Net with context_parallel_size > 1.
-# Merge commit: 2d1fa8d372a3990b0bb1334cd686f15005ee138f (2026-05-14)
-MEGATRON_COMMIT="2d1fa8d372a3990b0bb1334cd686f15005ee138f"
+# Override the image-baked megatron-core 0.18.0 with upstream main, which is
+# required for running Qwen3.5 Gated Delta Net with context_parallel_size > 1.
+# NVIDIA/Megatron-LM#2645 (merged 2026-05-14) introduced GDN packed-sequence /
+# CP support, but the GatedDeltaNet `cp_comm_type` kwarg that mbridge passes
+# was added in follow-up commits, so pinning to the #2645 merge commit isn't
+# enough — track `main`. If you need reproducibility, replace `main` with a
+# specific SHA from `git ls-remote https://github.com/NVIDIA/Megatron-LM main`.
+MEGATRON_REF="main"
 sudo python3 -m pip uninstall -y megatron-core --break-system-packages || true
 sudo python3 -m pip install --no-deps --break-system-packages \
-    "git+https://github.com/NVIDIA/Megatron-LM.git@${MEGATRON_COMMIT}"
+    "git+https://github.com/NVIDIA/Megatron-LM.git@${MEGATRON_REF}"
 python3 -c "import megatron.core as m; print('megatron-core:', m.__version__, m.__file__)"
 
 # Deps required by task-sync + mbridge HF loading path:
