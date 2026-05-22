@@ -11,6 +11,13 @@ fi
 TRAIN_SCRIPT=$1
 shift
 
+# Arnold/rh2 re-installs byted-wandb into ~/.local after setup.sh, which
+# shadows the clean wandb 0.16.6 we put in /usr/local and pulls in
+# byted-databus whose pb2 is incompatible with protobuf 4.x:
+#   TypeError: Descriptors cannot be created directly.
+# Tell Python to ignore ~/.local site-packages so only the system wandb loads.
+export PYTHONNOUSERSITE=1
+
 # Environment variables setup (defaults if not provided)
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
@@ -41,7 +48,8 @@ else
         RUNTIME_ENV_JSON="{
         \"env_vars\": {
             \"VLLM_USE_V1\": \"$VLLM_USE_V1\",
-            \"TORCH_CUDA_ARCH_LIST\": \"${TORCH_CUDA_ARCH_LIST:-9.0+PTX}\"
+            \"TORCH_CUDA_ARCH_LIST\": \"${TORCH_CUDA_ARCH_LIST:-9.0+PTX}\",
+            \"PYTHONNOUSERSITE\": \"1\"
         }
         }"
 

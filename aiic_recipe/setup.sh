@@ -1,5 +1,14 @@
 #!/bin/bash
 set -euxo pipefail
+
+# Ignore ~/.local/lib/python*/site-packages for ALL python invocations in this
+# script. Arnold seeds byted-wandb 0.13.94 into ~/.local, which shadows the
+# clean wandb we install into /usr/local and pulls in byted-databus whose pb2
+# crashes with protobuf >= 4. `sudo pip uninstall` cannot remove ~/.local
+# packages, so the cleanest fix is to make Python ignore that path entirely.
+# `start_ray.sh` sets the same flag for the training-time environment.
+export PYTHONNOUSERSITE=1
+
 sudo python3 -m pip install --no-deps -e . --break-system-packages
 sudo python3 -m pip uninstall bytedray -y --break-system-packages && sudo python3 -m pip install "ray[default]" --no-deps --break-system-packages
 sudo python3 -m pip install sandbox_fusion --break-system-packages
