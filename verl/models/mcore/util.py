@@ -570,8 +570,9 @@ def preprocess_bshd_engine(
     seqlens_in_batch = input_ids.offsets().diff()
     max_seqlen = seqlens_in_batch.max().item()
     tp_size = mpu.get_tensor_model_parallel_world_size()
-    # For CP, sequence length must be divisible by (2 * cp_size), and for SP by tp_size.
-    align_size = math.lcm(tp_size, 2 * cp_size) if cp_size > 1 else tp_size
+    # For CP, max_seqlen must be divisible by (2 * cp_size); after CP split the local
+    # sequence length (max_seqlen / cp_size) must also be divisible by tp_size for SP.
+    align_size = math.lcm(tp_size * cp_size, 2 * cp_size) if cp_size > 1 else tp_size
     if align_size > 1:
         pad_size = (align_size - max_seqlen % align_size) % align_size
         max_seqlen += pad_size
@@ -748,10 +749,11 @@ def build_vlm_attn_mask_bshd(input_ids: torch.Tensor, batch_size: int, pad_token
     seqlens_in_batch = input_ids.offsets().diff()
     max_seqlen = seqlens_in_batch.max().item()
 
-    # For CP, sequence length must be divisible by (2 * cp_size), and for SP by tp_size.
+    # For CP, max_seqlen must be divisible by (2 * cp_size); after CP split the local
+    # sequence length (max_seqlen / cp_size) must also be divisible by tp_size for SP.
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
-    align_size = math.lcm(tp_size, 2 * cp_size) if cp_size > 1 else tp_size
+    align_size = math.lcm(tp_size * cp_size, 2 * cp_size) if cp_size > 1 else tp_size
     if align_size > 1:
         pad_size = (align_size - max_seqlen % align_size) % align_size
         max_seqlen += pad_size
