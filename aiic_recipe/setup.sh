@@ -38,8 +38,8 @@ sudo python3 -m pip install tilelang --break-system-packages
 # Install wandb and protobuf last to avoid being overridden by other packages' deps
 # Note: also purge the user-local byted-wandb at ~/.local, otherwise it shadows
 # the system wandb and re-introduces the databus/protobuf pb2 import error.
-python3 -m pip uninstall byted-wandb wandb -y || true
-sudo python3 -m pip uninstall byted-wandb -y --break-system-packages && sudo python3 -m pip install wandb==0.16.6 --break-system-packages
+sudo python3 -m pip uninstall byted-wandb wandb -y --break-system-packages || true
+sudo python3 -m pip install wandb==0.16.6 --break-system-packages
 sudo python3 -m pip install protobuf==4.25.3 --break-system-packages
 
 git submodule update --init task-sync
