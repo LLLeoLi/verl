@@ -50,13 +50,15 @@ sudo python3 -m pip install --no-deps --break-system-packages \
     "git+https://github.com/NVIDIA/Megatron-LM.git@${MEGATRON_REF}"
 python3 -c "import megatron.core as m; print('megatron-core:', m.__version__, m.__file__)"
 
-# Deps required by task-sync + mbridge HF loading path:
-#   mcore-bridge          - needed when train_megatron.sh uses mbridge to load HF weights directly
-#   flash-linear-attention - required by Qwen3.5 Gated Delta Net linear attention
-#   tilelang              - used by task-sync kernels
 sudo python3 -m pip install 'mcore-bridge>=1.0.2' -U --break-system-packages
 sudo python3 -m pip install flash-linear-attention --break-system-packages
 sudo python3 -m pip install tilelang --break-system-packages
+
+# ↓↓↓ 在这之后插入补丁 ↓↓↓
+BRIDGE_VL=/usr/local/lib/python3.12/dist-packages/mbridge/models/qwen3_5/qwen3_5_vl_bridge.py
+sudo sed -i '/^\s*cp_comm_type="p2p",\s*$/d' "$BRIDGE_VL"
+sudo find /usr/local/lib/python3.12/dist-packages/mbridge -name '*.pyc' -delete
+grep -rn 'cp_comm_type' "$BRIDGE_VL" && { echo "patch failed"; exit 1; } || echo "mbridge cp_comm_type patch OK"
 
 git submodule update --init task-sync
 
