@@ -17,6 +17,17 @@ sudo python3 -m pip install aiohttp --break-system-packages
 sudo python3 -m pip install --upgrade jupyter_client ipykernel --break-system-packages
 sudo python3 -m pip install faker --break-system-packages
 
+# Replace byted-wandb 0.13.94 (the image-baked version, whose pb2 files break
+# once logfire/etc. bump protobuf to 6.x and trigger
+# `AttributeError: module 'wandb.proto.wandb_internal_pb2' has no attribute 'Result'`)
+# with vanilla wandb 0.16.6 + a compatible protobuf. This MUST happen before
+# the megatron-core install/verify below, because upstream megatron's
+# `megatron/core/timers.py` does `import wandb` at module top level, so any
+# `import megatron.core` triggers the wandb import chain.
+sudo python3 -m pip uninstall byted-wandb wandb -y --break-system-packages || true
+sudo python3 -m pip install wandb==0.16.6 --break-system-packages
+sudo python3 -m pip install protobuf==4.25.3 --break-system-packages
+
 # Override the image-baked megatron-core 0.18.0 with an upstream commit that
 # includes NVIDIA/Megatron-LM#2645 (GDN packed-sequence / CP support), required
 # for running Qwen3.5 Gated Delta Net with context_parallel_size > 1.
@@ -34,13 +45,6 @@ python3 -c "import megatron.core as m; print('megatron-core:', m.__version__, m.
 sudo python3 -m pip install 'mcore-bridge>=1.0.2' -U --break-system-packages
 sudo python3 -m pip install flash-linear-attention --break-system-packages
 sudo python3 -m pip install tilelang --break-system-packages
-
-# Install wandb and protobuf last to avoid being overridden by other packages' deps
-# Note: also purge the user-local byted-wandb at ~/.local, otherwise it shadows
-# the system wandb and re-introduces the databus/protobuf pb2 import error.
-sudo python3 -m pip uninstall byted-wandb wandb -y --break-system-packages || true
-sudo python3 -m pip install wandb==0.16.6 --break-system-packages
-sudo python3 -m pip install protobuf==4.25.3 --break-system-packages
 
 git submodule update --init task-sync
 
