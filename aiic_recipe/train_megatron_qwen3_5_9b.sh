@@ -90,7 +90,7 @@ env_batch_size=${env_batch_size:-8}
 env_group_size=${env_group_size:-32}
 ppo_mini_bsz=$((env_batch_size * env_group_size))
 
-ppo_micro_bsz_per_gpu=${ppo_micro_bsz_per_gpu:-2}
+ppo_micro_bsz_per_gpu=${ppo_micro_bsz_per_gpu:-1}
 temperature=${temperature:-1.0}
 clip_ratio_high=${clip_ratio_high:-0.28}
 total_epochs=${total_epochs:-5}
@@ -163,7 +163,8 @@ TRAIN_CMD=(
 
     # model & data
     actor_rollout_ref.model.path=${model_path}
-    actor_rollout_ref.model.use_remove_padding=False
+    actor_rollout_ref.model.use_remove_padding=True
+    actor_rollout_ref.model.use_fused_kernels=True
     actor_rollout_ref.model.enable_gradient_checkpointing=True
     actor_rollout_ref.env.tasks_dir=${data_dir}
     actor_rollout_ref.env.batch_size=${env_batch_size}
