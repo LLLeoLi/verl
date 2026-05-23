@@ -18,6 +18,21 @@ shift
 # Tell Python to ignore ~/.local site-packages so only the system wandb loads.
 export PYTHONNOUSERSITE=1
 
+# ----------------------------------------------------------------------------
+# Diagnostics: surface the real first-cause traceback when Ray cascades SIGTERM
+# ----------------------------------------------------------------------------
+export RAY_DEDUP_LOGS=0
+export HYDRA_FULL_ERROR=1
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_TIMEOUT=300
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=/tmp/nccl_debug_
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+export RAY_record_ref_creation_sites=1
+# CUDA_LAUNCH_BLOCKING=1 makes kernel-level tracebacks accurate but ~5-10% slower;
+# uncomment only when investigating a specific crash.
+# export CUDA_LAUNCH_BLOCKING=1
+
 # Environment variables setup (defaults if not provided)
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}
@@ -49,7 +64,15 @@ else
         \"env_vars\": {
             \"VLLM_USE_V1\": \"$VLLM_USE_V1\",
             \"TORCH_CUDA_ARCH_LIST\": \"${TORCH_CUDA_ARCH_LIST:-9.0+PTX}\",
-            \"PYTHONNOUSERSITE\": \"1\"
+            \"PYTHONNOUSERSITE\": \"1\",
+            \"RAY_DEDUP_LOGS\": \"0\",
+            \"HYDRA_FULL_ERROR\": \"1\",
+            \"TORCH_NCCL_ASYNC_ERROR_HANDLING\": \"1\",
+            \"NCCL_TIMEOUT\": \"300\",
+            \"TORCH_NCCL_DUMP_ON_TIMEOUT\": \"1\",
+            \"TORCH_NCCL_DEBUG_INFO_TEMP_FILE\": \"/tmp/nccl_debug_\",
+            \"TORCH_NCCL_TRACE_BUFFER_SIZE\": \"2000\",
+            \"RAY_record_ref_creation_sites\": \"1\"
         }
         }"
 
