@@ -669,7 +669,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                     transformer_config_dict.pop(key)
                 transformer_config_path = get_transformer_config_checkpoint_path(local_path)
                 with open(transformer_config_path, "w") as f:
-                    json.dump(transformer_config_dict, f, indent=2)
+                    json.dump(transformer_config_dict, f, indent=2, default=str)
 
         if self.should_save_hf_model and not self.use_hf_checkpoint:
             # wait for everyone to dump to local
