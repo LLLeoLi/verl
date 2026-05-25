@@ -30,7 +30,7 @@ from pathlib import Path
 # Default per-kernel address-space cap (bytes). Override via the
 # `mem_limit_bytes` kwarg to StatefulSandbox or the
 # VERL_SANDBOX_MEM_LIMIT_BYTES env var. 0 disables the cap.
-_DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_SANDBOX_MEM_LIMIT_BYTES", str(8 * 1024**3)))
+_DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_SANDBOX_MEM_LIMIT_BYTES", str(1 * 1024**3)))
 
 _KERNEL_START_LOCK = threading.Lock()
 
