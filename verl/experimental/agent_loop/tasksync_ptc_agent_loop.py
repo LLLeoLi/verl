@@ -39,7 +39,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
-from verl.experimental.agent_loop.landlock_sandbox import StatefulSandbox
+from verl.experimental.agent_loop.landlock_sandbox import StatefulSandbox, sandbox_startup_gate
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -325,20 +325,25 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
 
             env_dir = env.env_dir
 
-            ptc_sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
-            try:
-                ptc_sandbox.start()
-            except Exception as e:
-                logger.error(f"PTC sandbox failed to start for task {env.task_name}: {e}")
-                metrics["ptc_sandbox_start_error"] = str(e)
-                return self._build_early_termination_output(request_id, metrics)
+            # See tasksync_agent_loop.run() for the rationale behind gating +
+            # executor offload on the sandbox bring-up phase.
+            async with sandbox_startup_gate():
+                ptc_sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
+                try:
+                    await self.loop.run_in_executor(None, ptc_sandbox.start)
+                except Exception as e:
+                    logger.error(f"PTC sandbox failed to start for task {env.task_name}: {e}")
+                    metrics["ptc_sandbox_start_error"] = str(e)
+                    return self._build_early_termination_output(request_id, metrics)
 
-            setup_result = self._setup_ptc_sandbox_tools(ptc_sandbox, env)
-            if not setup_result.get("success"):
-                error_msg = setup_result.get("error", "Unknown error")
-                logger.error(f"PTC sandbox setup failed: {error_msg}")
-                metrics["ptc_setup_error"] = error_msg
-                return self._build_early_termination_output(request_id, metrics)
+                setup_result = await self.loop.run_in_executor(
+                    None, self._setup_ptc_sandbox_tools, ptc_sandbox, env
+                )
+                if not setup_result.get("success"):
+                    error_msg = setup_result.get("error", "Unknown error")
+                    logger.error(f"PTC sandbox setup failed: {error_msg}")
+                    metrics["ptc_setup_error"] = error_msg
+                    return self._build_early_termination_output(request_id, metrics)
 
             env.ptc_sandbox = ptc_sandbox
             env.terminal_executor = TerminalExecutor(env.workspace)
@@ -395,10 +400,15 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
 
         finally:
             if ptc_sandbox is not None:
-                ptc_sandbox.cleanup()
+                try:
+                    await self.loop.run_in_executor(None, ptc_sandbox.cleanup)
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup ptc_sandbox: {e}")
             if env_dir and os.path.exists(env_dir):
                 try:
-                    shutil.rmtree(env_dir, ignore_errors=True)
+                    await self.loop.run_in_executor(
+                        None, lambda: shutil.rmtree(env_dir, ignore_errors=True)
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to cleanup env_dir {env_dir}: {e}")
 
@@ -471,7 +481,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
 {TOOLS_PROXY_SOURCE}
 
 """)
-        result, success = sandbox.execute(setup_code)
+        result, success = sandbox.execute(setup_code, timeout=20.0)
         if not success:
             return {"success": False, "error": result}
         return {"success": True, "output": result}

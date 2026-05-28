@@ -14,6 +14,8 @@ Isolation strategy (layered):
      Landlock is unavailable.
 """
 
+import asyncio
+import contextlib
 import ctypes
 import os
 import re
@@ -37,6 +39,62 @@ _KERNEL_START_LOCK = threading.Lock()
 # Track all spawned kernel PIDs so we can force-kill stragglers between envs.
 _SPAWNED_PIDS: set[int] = set()
 _PID_LOCK = threading.Lock()
+
+# prctl(PR_SET_PDEATHSIG, sig) -- kernel sends `sig` to this process when its
+# parent dies. Linux-only; key=1 per <sys/prctl.h>. Preserved across execve()
+# for the no-setuid case we use here.
+_PR_SET_PDEATHSIG = 1
+
+
+# Cap on concurrent sandbox bring-up (fork ipykernel + import env.py +
+# Task_Env() construction). Each rollout brings up 1-2 sandboxes; under heavy
+# concurrency this stage saturates CPU/IO on the node and makes setup_code
+# run past the 20s execute() budget. The gate lets ample rollouts coexist
+# during generation -- only the bring-up phase is rate-limited.
+_DEFAULT_MAX_CONCURRENT_STARTUPS = int(
+    os.getenv("VERL_SANDBOX_MAX_CONCURRENT_STARTUPS", "16")
+)
+_STARTUP_SEM: asyncio.Semaphore | None = None
+
+
+def _get_startup_sem() -> asyncio.Semaphore:
+    """Lazily build the worker-wide sandbox-startup semaphore.
+
+    Bound to the running event loop on first call. Safe under single-threaded
+    asyncio (AgentLoopWorker has one event loop), no extra locking needed.
+    """
+    global _STARTUP_SEM
+    if _STARTUP_SEM is None:
+        _STARTUP_SEM = asyncio.Semaphore(_DEFAULT_MAX_CONCURRENT_STARTUPS)
+    return _STARTUP_SEM
+
+
+@contextlib.asynccontextmanager
+async def sandbox_startup_gate():
+    """Async gate around the sandbox bring-up phase. See _get_startup_sem()."""
+    sem = _get_startup_sem()
+    async with sem:
+        yield
+
+
+def _set_pdeathsig(sig: int) -> None:
+    """Best-effort: ask the kernel to deliver `sig` when our parent dies.
+
+    Called from preexec_fn (already in the forked child). Failure is silent --
+    we still have the explicit cleanup() path and kill_all_kernels() as
+    fallbacks if the syscall is unavailable.
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(
+            ctypes.c_int(_PR_SET_PDEATHSIG),
+            ctypes.c_ulong(sig),
+            ctypes.c_ulong(0),
+            ctypes.c_ulong(0),
+            ctypes.c_ulong(0),
+        )
+    except Exception:
+        pass
 
 
 def strip_ansi(text: str) -> str:
@@ -325,6 +383,10 @@ class StatefulSandbox:
         mem_limit = self.mem_limit_bytes
 
         def _preexec():
+            # Die with the parent. Prevents orphan ipykernels from surviving an
+            # AgentLoopWorker crash / SIGKILL / OOM-kill and slowly leaking
+            # memory on the node across retries.
+            _set_pdeathsig(signal.SIGKILL)
             # Cap address space so a single misbehaving kernel cannot OOM the
             # node. Soft+hard set to the same value; hitting it raises
             # MemoryError inside the kernel rather than killing the host.
@@ -471,7 +533,7 @@ class StatefulSandbox:
             except subprocess.TimeoutExpired:
                 pass
 
-    def _run(self, code: str) -> tuple[str, str, bool]:
+    def _run(self, code: str, timeout: float | None = None) -> tuple[str, str, bool]:
         """Execute code in the kernel and return (stdout, stderr, success)."""
         if self._dead:
             raise RuntimeError("Kernel was killed after a previous timeout")
@@ -482,7 +544,8 @@ class StatefulSandbox:
             )
         client = self._client
         msg_id = client.execute(code, silent=False, store_history=True)
-        deadline = time.time() + self.timeout
+        effective_timeout = self.timeout if timeout is None else timeout
+        deadline = time.time() + effective_timeout
 
         out_parts: list[str] = []
         err_parts: list[str] = []
@@ -533,13 +596,15 @@ class StatefulSandbox:
 
         return strip_ansi("".join(out_parts)), strip_ansi("".join(err_parts)), success
 
-    def execute(self, code: str) -> tuple[str, bool]:
+    def execute(self, code: str, timeout: float | None = None) -> tuple[str, bool]:
         """Execute code and return (output, success).
 
         State from previous calls is preserved. Returns an error string on
         failure rather than raising. ``success`` is False whenever the kernel
         reported an exception, the sandbox was unavailable, or execution timed
         out -- i.e. any case where ``output`` carries an error message.
+
+        ``timeout`` overrides the sandbox-level default for this single call.
         """
         if not isinstance(code, str):
             return (
@@ -554,8 +619,9 @@ class StatefulSandbox:
                 "[Error] Sandbox is no longer available "
                 "(killed after a previous timeout / crash). Subsequent code will not run."
             ), False
+        effective_timeout = self.timeout if timeout is None else timeout
         try:
-            output, error, success = self._run(code)
+            output, error, success = self._run(code, timeout=effective_timeout)
             result = output
             if error.strip():
                 result += ("\n[stderr]:\n" if result else "") + error.strip()
@@ -567,7 +633,7 @@ class StatefulSandbox:
                 else " Sandbox interrupted; state preserved."
             )
             return (
-                f"[Error] Code execution timed out ({self.timeout}-second limit).{suffix}",
+                f"[Error] Code execution timed out ({effective_timeout}-second limit).{suffix}",
                 False,
             )
         except Exception as e:

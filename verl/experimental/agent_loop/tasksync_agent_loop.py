@@ -27,6 +27,7 @@ task-sync envs differ from GEM planning envs in several key ways:
   - Prompt comes from a separate prompt.md file
   - Evaluation is workspace-file-based (claim_done triggers env.step)
 """
+import asyncio
 import importlib.util
 import json
 import logging
@@ -42,7 +43,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
-from verl.experimental.agent_loop.landlock_sandbox import StatefulSandbox
+from verl.experimental.agent_loop.landlock_sandbox import StatefulSandbox, sandbox_startup_gate
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -392,29 +393,40 @@ class TaskSyncAgentLoop(AgentLoopBase):
 
             env_dir = env.env_dir
 
-            sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
-            try:
-                sandbox.start()
-            except Exception as e:
-                logger.error(f"Sandbox failed to start for task {env.task_name}: {e}")
-                metrics["sandbox_start_error"] = str(e)
-                return self._build_early_termination_output(request_id, metrics)
-
-            if enable_ptc:
-                ptc_sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
+            # Sandbox bring-up (fork ipykernel + import env.py + Task_Env init)
+            # is the per-rollout step most prone to wall-clock blowup under
+            # heavy node-level concurrency. Two changes from the naive path:
+            #   - sandbox_startup_gate() caps how many bring-ups race at once
+            #     across this AgentLoopWorker (env: VERL_SANDBOX_MAX_CONCURRENT_STARTUPS)
+            #   - start() / setup_code execution run in the default executor so
+            #     other coroutines (generation, RPC) keep making progress while
+            #     a kernel is initializing.
+            async with sandbox_startup_gate():
+                sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
                 try:
-                    ptc_sandbox.start()
+                    await self.loop.run_in_executor(None, sandbox.start)
                 except Exception as e:
-                    logger.error(f"PTC sandbox failed to start for task {env.task_name}: {e}")
-                    metrics["ptc_sandbox_start_error"] = str(e)
+                    logger.error(f"Sandbox failed to start for task {env.task_name}: {e}")
+                    metrics["sandbox_start_error"] = str(e)
                     return self._build_early_termination_output(request_id, metrics)
 
-                setup_result = self._setup_ptc_sandbox_tools(ptc_sandbox, env)
-                if not setup_result.get("success"):
-                    error_msg = setup_result.get("error", "Unknown error")
-                    logger.error(f"PTC sandbox setup failed: {error_msg}")
-                    metrics["ptc_setup_error"] = error_msg
-                    return self._build_early_termination_output(request_id, metrics)
+                if enable_ptc:
+                    ptc_sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
+                    try:
+                        await self.loop.run_in_executor(None, ptc_sandbox.start)
+                    except Exception as e:
+                        logger.error(f"PTC sandbox failed to start for task {env.task_name}: {e}")
+                        metrics["ptc_sandbox_start_error"] = str(e)
+                        return self._build_early_termination_output(request_id, metrics)
+
+                    setup_result = await self.loop.run_in_executor(
+                        None, self._setup_ptc_sandbox_tools, ptc_sandbox, env
+                    )
+                    if not setup_result.get("success"):
+                        error_msg = setup_result.get("error", "Unknown error")
+                        logger.error(f"PTC sandbox setup failed: {error_msg}")
+                        metrics["ptc_setup_error"] = error_msg
+                        return self._build_early_termination_output(request_id, metrics)
 
             env.sandbox = sandbox
             env.ptc_sandbox = ptc_sandbox
@@ -461,13 +473,18 @@ class TaskSyncAgentLoop(AgentLoopBase):
                     state = AgentState.TERMINATED
 
         finally:
+            cleanup_futures = []
             if ptc_sandbox is not None:
-                ptc_sandbox.cleanup()
+                cleanup_futures.append(self.loop.run_in_executor(None, ptc_sandbox.cleanup))
             if sandbox is not None:
-                sandbox.cleanup()
+                cleanup_futures.append(self.loop.run_in_executor(None, sandbox.cleanup))
+            if cleanup_futures:
+                await asyncio.gather(*cleanup_futures, return_exceptions=True)
             if env_dir and os.path.exists(env_dir):
                 try:
-                    shutil.rmtree(env_dir, ignore_errors=True)
+                    await self.loop.run_in_executor(
+                        None, lambda: shutil.rmtree(env_dir, ignore_errors=True)
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to cleanup env_dir {env_dir}: {e}")
 
@@ -543,7 +560,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
 {TOOLS_PROXY_SOURCE}
 
 """)
-        result, success = sandbox.execute(setup_code)
+        result, success = sandbox.execute(setup_code, timeout=20.0)
         if not success:
             return {"success": False, "error": result}
         return {"success": True, "output": result}
