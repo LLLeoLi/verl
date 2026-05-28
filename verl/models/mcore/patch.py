@@ -390,6 +390,119 @@ def apply_patch_mbridge():
         megatron.core.utils.get_tensor_model_parallel_group_if_none = get_tensor_model_parallel_group_if_none
 
 
+def patch_mbridge_packed_seqs():
+    """Fix mbridge's preprocess_packed_seqs first-half slice when a sequence is
+    shorter than its CP-padded length.
+
+    Upstream mbridge.core.util.preprocess_packed_seqs clamps only the second
+    half-slice against d.shape[0]; the first half-slice can therefore expand
+    into an empty source and crash with:
+        RuntimeError: The expanded size of the tensor (N) must match the
+                      existing size (0) at non-singleton dimension 0.
+
+    Call this AFTER mbridge has been imported so we also patch every model
+    module that captured the symbol via `from mbridge.core.util import
+    preprocess_packed_seqs`.
+    """
+    import sys
+
+    try:
+        import mbridge.core.util as _mb_util
+    except ImportError:
+        return
+
+    import torch
+    from megatron.core import parallel_state as mpu
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    def preprocess_packed_seqs_safe(
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pre_process: bool = True,
+    ):
+        batch_size = input_ids.shape[0]
+
+        seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
+        tp_size = mpu.get_tensor_model_parallel_world_size()
+        cp_size = mpu.get_context_parallel_world_size()
+        cp_rank = mpu.get_context_parallel_rank()
+        align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+
+        pad_size = (align_size - seqlens_in_batch % align_size) % align_size
+        seqlens_in_batch_padded = seqlens_in_batch + pad_size
+
+        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=input_ids.device)
+        cu_seqlens[1:] = torch.cumsum(seqlens_in_batch, dim=0)
+        cu_seqlens_padded = torch.zeros(batch_size + 1, dtype=torch.int32, device=input_ids.device)
+        cu_seqlens_padded[1:] = torch.cumsum(seqlens_in_batch_padded, dim=0)
+
+        seqlens_in_batch_cpu = seqlens_in_batch.tolist()
+        seqlens_in_batch_padded_cpu = seqlens_in_batch_padded.tolist()
+        cu_seqlens_padded_cpu = cu_seqlens_padded.tolist()
+
+        max_seqlen_in_batch = max(seqlens_in_batch_padded_cpu) if seqlens_in_batch_padded_cpu else 0
+
+        shape = list(input_ids.shape[1:])
+        shape[0] = sum(seqlens_in_batch_padded_cpu) // max(cp_size, 1)
+        if pre_process:
+            input_ids_rmpad = torch.zeros(shape, dtype=input_ids.dtype, device=input_ids.device)
+            for i in range(batch_size):
+                if cp_size <= 1:
+                    seqlen = seqlens_in_batch_cpu[i]
+                    start_idx = cu_seqlens_padded_cpu[i]
+                    input_ids_rmpad[start_idx : start_idx + seqlen] = input_ids[i, attention_mask[i]]
+                    continue
+
+                seqlen_padded_i = seqlens_in_batch_padded_cpu[i]
+                seqlen = seqlen_padded_i // cp_size
+                half_seqlen = seqlen // 2
+                start_idx = cu_seqlens_padded_cpu[i] // cp_size
+                d = input_ids[i, attention_mask[i]]
+
+                # First half-chunk owned by this CP rank: clamp against real d length.
+                first_start = half_seqlen * cp_rank
+                first_end = min(half_seqlen * (cp_rank + 1), d.shape[0])
+                first_len = max(first_end - first_start, 0)
+                if first_len > 0:
+                    input_ids_rmpad[start_idx : start_idx + first_len] = d[first_start:first_end]
+
+                # Second (mirrored) half-chunk: same clamp logic as upstream.
+                remain_start = seqlen_padded_i - half_seqlen * (cp_rank + 1)
+                remain_end = seqlen_padded_i - half_seqlen * cp_rank
+                remain_end = min(remain_end, d.shape[0])
+                remain_len = max(remain_end - remain_start, 0)
+                if remain_len > 0:
+                    input_ids_rmpad[start_idx + half_seqlen : start_idx + half_seqlen + remain_len] = d[
+                        remain_start:remain_end
+                    ]
+
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen_in_batch,
+            cu_seqlens_kv=cu_seqlens_padded,
+            max_seqlen_kv=max_seqlen_in_batch,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+        )
+        if pre_process:
+            return input_ids_rmpad.unsqueeze(0), packed_seq_params
+        return input_ids, packed_seq_params
+
+    original = getattr(_mb_util, "preprocess_packed_seqs", None)
+    _mb_util.preprocess_packed_seqs = preprocess_packed_seqs_safe
+
+    # Re-bind in every already-imported mbridge.* module that captured the
+    # symbol via `from mbridge.core.util import preprocess_packed_seqs`.
+    for mod_name, mod in list(sys.modules.items()):
+        if not mod_name.startswith("mbridge."):
+            continue
+        if mod is None or mod is _mb_util:
+            continue
+        if getattr(mod, "preprocess_packed_seqs", None) is original:
+            mod.preprocess_packed_seqs = preprocess_packed_seqs_safe
+
+
 def apply_patch_megatron_v012_with_torch_v28():
     # Error due to missing serialization_format in _write_item of megatron v012;
     # resolved by using megatron v013's implementation.

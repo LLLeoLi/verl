@@ -15,11 +15,15 @@
 
 # VANILLA_MBRIDGE
 try:
-    from verl.models.mcore.patch import apply_patch_mbridge
+    from verl.models.mcore.patch import apply_patch_mbridge, patch_mbridge_packed_seqs
 
     apply_patch_mbridge()
     from mbridge import AutoBridge
     from mbridge.utils.post_creation_callbacks import freeze_moe_router, make_value_model
+
+    # Must run AFTER mbridge import: re-bind preprocess_packed_seqs everywhere it
+    # was captured via `from mbridge.core.util import preprocess_packed_seqs`.
+    patch_mbridge_packed_seqs()
 except ImportError:
     print("mbridge package not found. Please install mbridge with `pip install verl[mcore]` or `pip install mbridge`")
     raise
