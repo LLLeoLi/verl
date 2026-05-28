@@ -139,7 +139,7 @@ test_freq=${test_freq:--1}
 sm_warmup=${sm_warmup:-False}
 agent_loop=${agent_loop:-tasksync_agent}
 # Qwen3-8B emits Hermes-style JSON inside <tool_call>...</tool_call>.
-tool_call_format=${tool_call_format:-json}
+tool_call_format=${tool_call_format:-xml}
 
 # ==============================================================================
 # Experiment name
