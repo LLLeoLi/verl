@@ -60,6 +60,13 @@ sudo sed -i '/^\s*cp_comm_type="p2p",\s*$/d' "$BRIDGE_VL"
 sudo find /usr/local/lib/python3.12/dist-packages/mbridge -name '*.pyc' -delete
 grep -rn 'cp_comm_type' "$BRIDGE_VL" && { echo "patch failed"; exit 1; } || echo "mbridge cp_comm_type patch OK"
 
+# Make the dense Qwen3 bridge build a real YARN RoPE on the training side so it
+# matches the YARN vLLM applies during rollout. Without this, mbridge maps
+# rope_scaling.factor -> seq_len_interpolation_factor (linear PI), causing a
+# rollout/training RoPE mismatch that collapses Qwen3-8B RL training. Idempotent.
+sudo env PYTHONNOUSERSITE=1 python3 aiic_recipe/patch_qwen3_yarn.py
+sudo find /usr/local/lib/python3.12/dist-packages/mbridge -name '*.pyc' -delete
+
 git submodule update --init task-sync
 
 # Optionally download a model. No download happens unless `--model` is passed.
