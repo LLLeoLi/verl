@@ -152,7 +152,37 @@ def main():
 
     cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     head_dim = getattr(cfg, "head_dim", None) or (cfg.hidden_size // cfg.num_attention_heads)
-    base = float(getattr(cfg, "rope_theta", 10000.0))
+
+    # rope_theta: read from ALL plausible locations and cross-check. Different
+    # transformers versions keep it at top level, or fold it into rope_scaling /
+    # rope_parameters when rope scaling is present. Silently defaulting to 10000
+    # (the HF class default) hides a catastrophic base mismatch, so we surface it.
+    import json
+    import os
+    raw_cfg = {}
+    cfg_path = os.path.join(args.model, "config.json")
+    if os.path.isfile(cfg_path):
+        with open(cfg_path) as fh:
+            raw_cfg = json.load(fh)
+    candidates = {
+        "config.json (on disk)": raw_cfg.get("rope_theta"),
+        "AutoConfig.rope_theta": getattr(cfg, "rope_theta", None),
+        "rope_scaling.rope_theta": (getattr(cfg, "rope_scaling", None) or {}).get("rope_theta"),
+        "rope_parameters.rope_theta": (getattr(cfg, "rope_parameters", None) or {}).get("rope_theta"),
+    }
+    found = {k: v for k, v in candidates.items() if v is not None}
+    print("rope_theta sources :", found if found else "NONE FOUND")
+    # Source of truth = the on-disk file (what you edit; what the bridge/vLLM derive from).
+    base = raw_cfg.get("rope_theta") or getattr(cfg, "rope_theta", None)
+    if base is None:
+        print("!!! WARNING: rope_theta not found anywhere — falling back to 10000.0. "
+              "Qwen3-8B MUST be 1000000. FIX config.json before training.")
+        base = 10000.0
+    base = float(base)
+    distinct = {float(v) for v in found.values()}
+    if len(distinct) > 1:
+        print(f"!!! WARNING: rope_theta DISAGREES across sources {found}. The training "
+              "bridge / vLLM may read a different one than you expect — reconcile before training.")
     rs = getattr(cfg, "rope_scaling", None)
     assert rs, "no rope_scaling in config — nothing to verify"
     rope_type = rs.get("rope_type") or rs.get("type")
