@@ -219,7 +219,10 @@ TRAIN_CMD=(
     actor_rollout_ref.actor.megatron.context_parallel_size=${actor_cp}
 
     # actor megatron fused kernels (dense-safe)
-    +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True
+    # NOTE: must stay False when YARN rope_scaling is active — the fused THD RoPE
+    # kernel drops the YARN mscale under sequence packing, desyncing rollout vs
+    # training RoPE. See aiic_recipe/patch_qwen3_yarn.py.
+    +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=False
     +actor_rollout_ref.actor.megatron.override_transformer_config.masked_softmax_fusion=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.bias_activation_fusion=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.bias_dropout_fusion=True
