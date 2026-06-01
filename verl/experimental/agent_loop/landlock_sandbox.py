@@ -15,6 +15,7 @@ Isolation strategy (layered):
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import ctypes
 import os
@@ -32,7 +33,7 @@ from pathlib import Path
 # Default per-kernel address-space cap (bytes). Override via the
 # `mem_limit_bytes` kwarg to StatefulSandbox or the
 # VERL_SANDBOX_MEM_LIMIT_BYTES env var. 0 disables the cap.
-_DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_SANDBOX_MEM_LIMIT_BYTES", str(1 * 1024**3)))
+_DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_SANDBOX_MEM_LIMIT_BYTES", str(8 * 1024**3)))
 
 _KERNEL_START_LOCK = threading.Lock()
 
@@ -95,6 +96,19 @@ def _set_pdeathsig(sig: int) -> None:
         )
     except Exception:
         pass
+
+
+# Dedicated, process-lifetime thread used ONLY to fork (Popen) sandbox kernels.
+# PR_SET_PDEATHSIG (set in _preexec) delivers the death signal when the *thread*
+# that called fork() exits -- NOT when the process exits. A run_in_executor()
+# pool thread is transient and gets recycled, which would SIGKILL live kernels
+# mid-rollout. Forking from this single, never-shutdown thread makes the death
+# signal fire only when the worker process actually dies. Popen returns once the
+# child is exec'd (~ms), so serializing just the fork costs nothing -- the slow
+# conn-file wait / channel setup still run on the caller's thread.
+_FORK_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="sandbox-fork"
+)
 
 
 def strip_ansi(text: str) -> str:
@@ -398,7 +412,11 @@ class StatefulSandbox:
             if landlock_ok:
                 _apply_landlock(writable)
 
-        self._proc = subprocess.Popen(
+        # Fork on the dedicated lifetime thread (see _FORK_EXECUTOR) so the
+        # kernel's PR_SET_PDEATHSIG is bound to a thread that lives as long as
+        # the worker process, not a recyclable run_in_executor() pool thread.
+        self._proc = _FORK_EXECUTOR.submit(
+            subprocess.Popen,
             [sys.executable, "-m", "ipykernel_launcher", "-f", str(self._conn_file)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -406,7 +424,7 @@ class StatefulSandbox:
             cwd=self.workspace_path,
             start_new_session=True,
             preexec_fn=_preexec,
-        )
+        ).result()
 
         with _PID_LOCK:
             _SPAWNED_PIDS.add(self._proc.pid)
@@ -430,10 +448,17 @@ class StatefulSandbox:
         if not acquired:
             raise RuntimeError("Timed out waiting for kernel start lock")
         try:
+            # Only channel/connection bring-up needs serializing (jupyter_client
+            # connection-file load + ZMQ port setup is not concurrency-safe).
             client.start_channels()
-            client.wait_for_ready(timeout=10.0)
         finally:
             _KERNEL_START_LOCK.release()
+        # wait_for_ready() only polls the kernel's status channel and can block
+        # up to its full timeout. Keeping it inside the lock serializes every
+        # kernel start behind a ~10s critical section, which produces an
+        # acquire() convoy ("Timed out waiting for kernel start lock") once a
+        # few sandboxes start concurrently. Wait outside the lock instead.
+        client.wait_for_ready(timeout=10.0)
 
         self._client = client
         self._landlock_active = landlock_ok

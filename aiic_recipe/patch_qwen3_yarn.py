@@ -73,37 +73,14 @@ STOCK_RE = re.compile(
 
 
 def find_qwen3_bridge() -> str:
-    # Locate mbridge/models/qwen3.py WITHOUT importing mbridge. Importing it pulls
-    # in megatron.core -> wandb/torch/CUDA, which can hang during setup (no ray yet)
-    # and get the whole job SIGTERM'd. find_spec only resolves the package location;
-    # it does not execute mbridge/__init__.py.
-    import importlib.util
-    import glob
-
-    base = None
     try:
-        spec = importlib.util.find_spec("mbridge")
-        if spec is not None and spec.origin:
-            base = os.path.dirname(spec.origin)
-        elif spec is not None and spec.submodule_search_locations:
-            base = list(spec.submodule_search_locations)[0]
-    except Exception:  # noqa: BLE001
-        base = None
-
-    candidates = []
-    if base:
-        candidates.append(os.path.join(base, "models", "qwen3.py"))
-    # Fallback: scan sys.path for an installed mbridge without importing it.
-    for p in sys.path:
-        candidates.extend(glob.glob(os.path.join(p, "mbridge", "models", "qwen3.py")))
-
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    sys.exit(
-        "ERROR: could not locate mbridge/models/qwen3.py (is mbridge installed?). "
-        f"Searched: {candidates}"
-    )
+        import mbridge  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"ERROR: cannot import mbridge ({e}). Install it first.")
+    path = os.path.join(os.path.dirname(mbridge.__file__), "models", "qwen3.py")
+    if not os.path.isfile(path):
+        sys.exit(f"ERROR: {path} not found (mbridge layout changed?).")
+    return path
 
 
 def main():
