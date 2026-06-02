@@ -73,11 +73,28 @@ STOCK_RE = re.compile(
 
 
 def find_qwen3_bridge() -> str:
+    # Locate the package directory WITHOUT importing mbridge. `import mbridge`
+    # eagerly pulls in the full bridge stack (megatron-core, and the freshly
+    # installed flash-linear-attention / tilelang), whose first-import Triton/
+    # tilelang JIT compilation can stall setup.sh for many minutes. find_spec
+    # finds a top-level package's directory without executing its __init__.py.
+    import importlib.util
+
+    pkg_dir = None
     try:
-        import mbridge  # noqa: F401
-    except Exception as e:  # noqa: BLE001
-        sys.exit(f"ERROR: cannot import mbridge ({e}). Install it first.")
-    path = os.path.join(os.path.dirname(mbridge.__file__), "models", "qwen3.py")
+        spec = importlib.util.find_spec("mbridge")
+        if spec and spec.submodule_search_locations:
+            pkg_dir = list(spec.submodule_search_locations)[0]
+    except Exception:  # noqa: BLE001
+        pkg_dir = None
+    if not pkg_dir:
+        # Fallback to the known dist-packages layout used by setup.sh.
+        guess = "/usr/local/lib/python3.12/dist-packages/mbridge"
+        if os.path.isdir(guess):
+            pkg_dir = guess
+    if not pkg_dir:
+        sys.exit("ERROR: cannot locate the mbridge package. Install it first.")
+    path = os.path.join(pkg_dir, "models", "qwen3.py")
     if not os.path.isfile(path):
         sys.exit(f"ERROR: {path} not found (mbridge layout changed?).")
     return path
