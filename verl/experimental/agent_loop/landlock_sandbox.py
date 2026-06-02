@@ -49,11 +49,25 @@ _PR_SET_PDEATHSIG = 1
 
 # Cap on concurrent sandbox bring-up (fork ipykernel + import env.py +
 # Task_Env() construction). Each rollout brings up 1-2 sandboxes; under heavy
-# concurrency this stage saturates CPU/IO on the node and makes setup_code
-# run past the 20s execute() budget. The gate lets ample rollouts coexist
-# during generation -- only the bring-up phase is rate-limited.
+# concurrency this stage saturates CPU/IO/RAM on the node and makes setup_code
+# run past the execute() budget -> StatefulSandbox.start() / setup time out ->
+# the rollout is dropped to an empty trajectory.
+#
+# This gate is process-wide, i.e. PER AgentLoopWorker. Workers are round-robin
+# scheduled one-per-node (see AgentLoopManager._init_agent_loop_workers), so the
+# value is effectively the per-node concurrent-bring-up cap. With ptc_mode=ptc
+# each admitted rollout starts 2 kernels, so the node sees up to 2x this many
+# kernels initializing at once.
+#
+# Keep this small. The pre-0528 path ran bring-up synchronously on the event
+# loop, which serialized it to ~1 rollout (2 kernels) at a time per node and had
+# a <1% empty-trajectory rate. A value of 16 here meant ~32 kernels racing per
+# node and pushed heavy envs past their setup budget (3%+ empty, up to ~15/16 on
+# the heaviest tasks). 4 keeps enough overlap to hide per-bring-up latency
+# without the contention. Tune up only if bring-up latency dominates and the
+# node has spare CPU/RAM.
 _DEFAULT_MAX_CONCURRENT_STARTUPS = int(
-    os.getenv("VERL_SANDBOX_MAX_CONCURRENT_STARTUPS", "16")
+    os.getenv("VERL_SANDBOX_MAX_CONCURRENT_STARTUPS", "4")
 )
 _STARTUP_SEM: asyncio.Semaphore | None = None
 
@@ -109,6 +123,37 @@ def _set_pdeathsig(sig: int) -> None:
 _FORK_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="sandbox-fork"
 )
+
+
+# Worker-wide pool for the *steady-state* blocking tool calls (sandbox.execute /
+# terminal.execute) that run on every agent turn. These are subprocess-backed
+# (jupyter ZMQ / Popen) and were previously invoked synchronously inside the
+# agent-loop coroutine, which froze the AgentLoopWorker's single event loop --
+# and therefore all other rollouts' LLM generation -- for the full duration of
+# each Python/terminal call. Offloading them here lets the event loop keep
+# driving generation while tool code runs.
+#
+# max_workers is the per-node cap on concurrent tool executions. Correctness
+# note: a given sandbox is only ever executed by one rollout, and that rollout
+# awaits its tool calls in order, so no sandbox is touched by two threads at
+# once (sequential cross-thread use of a jupyter client is safe; concurrent is
+# not). This pool must NOT be used for in-process Task_Env calls (env.step /
+# env tools) -- those hold thread-affine state (e.g. a sqlite3 connection bound
+# to the event-loop thread) and stay on the event loop.
+_DEFAULT_MAX_CONCURRENT_TOOL_EXEC = int(
+    os.getenv("VERL_SANDBOX_MAX_CONCURRENT_EXEC", "32")
+)
+_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_DEFAULT_MAX_CONCURRENT_TOOL_EXEC, thread_name_prefix="sandbox-tool"
+)
+
+
+def get_tool_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Worker-wide executor for blocking sandbox/terminal tool calls.
+
+    See _TOOL_EXECUTOR. Bounded by VERL_SANDBOX_MAX_CONCURRENT_EXEC.
+    """
+    return _TOOL_EXECUTOR
 
 
 def strip_ansi(text: str) -> str:

@@ -43,7 +43,11 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
-from verl.experimental.agent_loop.landlock_sandbox import StatefulSandbox, sandbox_startup_gate
+from verl.experimental.agent_loop.landlock_sandbox import (
+    StatefulSandbox,
+    get_tool_executor,
+    sandbox_startup_gate,
+)
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -51,6 +55,14 @@ from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+# Wall-clock budget for the one-shot setup_code (import env.py + construct
+# Task_Env + install the tools proxy). This runs while up to
+# VERL_SANDBOX_MAX_CONCURRENT_STARTUPS bring-ups race, so it must absorb
+# transient CPU/IO contention -- exceeding it drops the rollout to an empty
+# trajectory. Heavy envs finish in <10s uncontended; 60s leaves margin under
+# concurrency without masking a genuinely hung kernel.
+_SANDBOX_SETUP_TIMEOUT = float(os.getenv("VERL_SANDBOX_SETUP_TIMEOUT", "60.0"))
 
 
 # ============================================================================
@@ -560,7 +572,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
 {TOOLS_PROXY_SOURCE}
 
 """)
-        result, success = sandbox.execute(setup_code, timeout=20.0)
+        result, success = sandbox.execute(setup_code, timeout=_SANDBOX_SETUP_TIMEOUT)
         if not success:
             return {"success": False, "error": result}
         return {"success": True, "output": result}
@@ -640,7 +652,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             tool_name = tool_call.get("name", "")
             tool_args = tool_call.get("arguments", {})
 
-            observation, reward, done = self._execute_tool(
+            observation, reward, done = await self._execute_tool(
                 env, tool_name, tool_args, agent_data, reward_type=reward_type
             )
             tool_messages.append({"role": "tool", "content": observation, "name": tool_name})
@@ -670,7 +682,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         agent_data.user_turns += 1
         return AgentState.GENERATING
 
-    def _execute_tool(
+    async def _execute_tool(
         self,
         env: TaskSyncEnvState,
         tool_name: str,
@@ -678,6 +690,24 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         agent_data: TaskSyncAgentData,
         reward_type: str,
     ) -> tuple[str, float, bool]:
+        # Correctness model for the offloaded branches below: subprocess-backed
+        # tool calls (execute_python / programmatic_tool_call / terminal) run on
+        # the shared get_tool_executor() pool so they do not block the worker
+        # event loop (which would stall every other rollout's generation). This
+        # is safe because each sandbox belongs to exactly one rollout and that
+        # rollout awaits its tool calls in order -- no sandbox is ever touched
+        # by two threads concurrently. Counters and the result handling stay on
+        # the event-loop thread (only the .execute() call is offloaded), so no
+        # shared agent_data state is mutated off-thread.
+        #
+        # claim_done (env.step) and the env-tool fallback (env.execute_tool) run
+        # the task's Task_Env *in-process*; that object was constructed on the
+        # event-loop thread and may hold thread-affine state (e.g. a sqlite3
+        # connection with check_same_thread=True). They therefore stay
+        # synchronous on the event loop and are NOT offloaded.
+        loop = self.loop
+        tool_executor = get_tool_executor()
+
         if tool_name == "tool_call_parse_error":
             # Synthesised by _handle_generating_state when the model emitted a
             # malformed tool call. Surface the parse error back as a tool
@@ -714,7 +744,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             sandbox = env.sandbox
             if sandbox is None:
                 return "Error: Sandbox not initialized", 0.0, False
-            result, _ = sandbox.execute(code)
+            result, _ = await loop.run_in_executor(tool_executor, sandbox.execute, code)
             return result, 0.0, False
 
         if tool_name == "programmatic_tool_call":
@@ -724,7 +754,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             if ptc_sandbox is None:
                 agent_data.programmatic_tool_call_error_count += 1
                 return "Error: PTC sandbox not initialized", 0.0, False
-            result, success = ptc_sandbox.execute(code)
+            result, success = await loop.run_in_executor(tool_executor, ptc_sandbox.execute, code)
             if not success:
                 agent_data.programmatic_tool_call_error_count += 1
             return result, 0.0, False
@@ -736,7 +766,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             if terminal is None:
                 return json.dumps({"error": "Terminal not available"}), 0.0, False
             try:
-                result = terminal.execute(command)
+                result = await loop.run_in_executor(tool_executor, terminal.execute, command)
             except TerminalError as e:
                 result = f"[Terminal Error] {e}"
             return result, 0.0, False

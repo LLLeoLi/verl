@@ -39,7 +39,11 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
-from verl.experimental.agent_loop.landlock_sandbox import StatefulSandbox, sandbox_startup_gate
+from verl.experimental.agent_loop.landlock_sandbox import (
+    StatefulSandbox,
+    get_tool_executor,
+    sandbox_startup_gate,
+)
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -47,6 +51,11 @@ from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+# See tasksync_agent_loop._SANDBOX_SETUP_TIMEOUT for rationale: budget for the
+# one-shot setup_code, widened so transient bring-up contention does not drop a
+# rollout to an empty trajectory.
+_SANDBOX_SETUP_TIMEOUT = float(os.getenv("VERL_SANDBOX_SETUP_TIMEOUT", "60.0"))
 
 
 # ============================================================================
@@ -481,7 +490,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
 {TOOLS_PROXY_SOURCE}
 
 """)
-        result, success = sandbox.execute(setup_code, timeout=20.0)
+        result, success = sandbox.execute(setup_code, timeout=_SANDBOX_SETUP_TIMEOUT)
         if not success:
             return {"success": False, "error": result}
         return {"success": True, "output": result}
@@ -554,7 +563,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             tool_args = tool_call.get("arguments", {})
 
             try:
-                observation, reward, done = self._execute_tool(
+                observation, reward, done = await self._execute_tool(
                     env, tool_name, tool_args, agent_data, reward_type=reward_type
                 )
             except Exception as e:
@@ -593,7 +602,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         agent_data.user_turns += 1
         return AgentState.GENERATING
 
-    def _execute_tool(
+    async def _execute_tool(
         self,
         env: TaskSyncEnvState,
         tool_name: str,
@@ -601,6 +610,16 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         agent_data: TaskSyncAgentData,
         reward_type: str,
     ) -> tuple[str, float, bool]:
+        # See tasksync_agent_loop._execute_tool for the correctness model:
+        # subprocess-backed tool calls (programmatic_tool_call / terminal) are
+        # offloaded to get_tool_executor() so they do not block the worker event
+        # loop; each sandbox is single-rollout and its calls are awaited in
+        # order, so no sandbox runs on two threads at once. claim_done
+        # (env.step) and direct env-tool calls run the in-process Task_Env and
+        # stay synchronous on the event loop (thread-affine sqlite state).
+        loop = self.loop
+        tool_executor = get_tool_executor()
+
         if tool_name == "claim_done":
             action = arguments.get("action", "")
             try:
@@ -631,7 +650,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             if ptc_sandbox is None:
                 agent_data.programmatic_tool_call_error_count += 1
                 return "Error: PTC sandbox not initialized", 0.0, False
-            result, success = ptc_sandbox.execute(code)
+            result, success = await loop.run_in_executor(tool_executor, ptc_sandbox.execute, code)
             if not success:
                 agent_data.programmatic_tool_call_error_count += 1
             return result, 0.0, False
@@ -643,7 +662,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             if terminal is None:
                 return json.dumps({"error": "Terminal not available"}), 0.0, False
             try:
-                result = terminal.execute(command)
+                result = await loop.run_in_executor(tool_executor, terminal.execute, command)
             except TerminalError as e:
                 result = f"[Terminal Error] {e}"
             return result, 0.0, False
