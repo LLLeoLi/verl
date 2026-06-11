@@ -46,6 +46,7 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetr
 from verl.experimental.agent_loop.landlock_sandbox import (
     StatefulSandbox,
     get_tool_executor,
+    kill_all_kernels,
     sandbox_startup_gate,
 )
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
@@ -63,6 +64,52 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 # trajectory. Heavy envs finish in <10s uncontended; 60s leaves margin under
 # concurrency without masking a genuinely hung kernel.
 _SANDBOX_SETUP_TIMEOUT = float(os.getenv("VERL_SANDBOX_SETUP_TIMEOUT", "60.0"))
+
+# Cap on rollouts concurrently holding live episode resources: an env_dir with
+# its sqlite db, an in-process Task_Env, and 1-2 ipykernel sandboxes.
+#
+# AgentLoopWorker.generate_sequences launches its WHOLE chunk with
+# asyncio.gather, so without this gate the steady-state population of live
+# kernels on a node scales linearly with env.batch_size * env.group_size:
+#   kernels/node ~= 2 * batch_size * group_size / nnodes   (ptc mode)
+# Raising group_size therefore grows the node's resident-kernel count without
+# bound until the OOM killer takes out a Ray worker, or the AgentLoopWorker
+# process exhausts file descriptors (~10 ZMQ fds per live rollout). The
+# sandbox_startup_gate only bounds concurrent *bring-up*, not the steady-state
+# population -- this gate bounds the population.
+#
+# The gate is process-wide, i.e. PER AgentLoopWorker. The default of 32 equals
+# the per-worker chunk size of the default config (batch_size=8 * group_size=32
+# / num_workers=8), so default runs are unaffected; larger group_size values
+# queue instead of piling up. Tune via VERL_TASKSYNC_MAX_CONCURRENT_ROLLOUTS;
+# kernels per worker stay <= 2x this value.
+_DEFAULT_MAX_CONCURRENT_ROLLOUTS = int(
+    os.getenv("VERL_TASKSYNC_MAX_CONCURRENT_ROLLOUTS", "32")
+)
+_ROLLOUT_SEM: asyncio.Semaphore | None = None
+
+# Episodes currently inside the admission gate on this worker. Maintained on
+# the event-loop thread only (no locking needed). When it drops to zero --
+# i.e. at the end of a generation step -- any kernel PID still tracked by
+# landlock_sandbox belongs to a sandbox whose per-rollout cleanup failed or
+# was cancelled mid-await (task cancellation aborts the awaits in run()'s
+# finally block). Those orphans used to accumulate monotonically across steps
+# until the node OOMed and the raylet was SIGKILLed; the end-of-step
+# kill_all_kernels() sweep in run() reaps them. It is a no-op when nothing
+# leaked.
+_INFLIGHT_ROLLOUTS = 0
+
+
+def _get_rollout_sem() -> asyncio.Semaphore:
+    """Lazily build the worker-wide live-rollout admission semaphore.
+
+    Bound to the running event loop on first call. Safe under single-threaded
+    asyncio (AgentLoopWorker has one event loop), no extra locking needed.
+    """
+    global _ROLLOUT_SEM
+    if _ROLLOUT_SEM is None:
+        _ROLLOUT_SEM = asyncio.Semaphore(_DEFAULT_MAX_CONCURRENT_ROLLOUTS)
+    return _ROLLOUT_SEM
 
 
 # ============================================================================
@@ -395,9 +442,17 @@ class TaskSyncAgentLoop(AgentLoopBase):
         env_dir = None
         env = None
         agent_data: Optional[TaskSyncAgentData] = None
+        # Admission gate: bounds how many rollouts hold live envs/sandboxes at
+        # once on this worker (see _get_rollout_sem). Held for the whole
+        # episode and released after cleanup, so the kernel population -- not
+        # just bring-up -- is capped regardless of env.group_size.
+        rollout_gate = _get_rollout_sem()
+        await rollout_gate.acquire()
+        global _INFLIGHT_ROLLOUTS
+        _INFLIGHT_ROLLOUTS += 1
         try:
             try:
-                env = self._create_env_from_task_info(task_info, enable_ptc=enable_ptc)
+                env = await self._create_env_from_task_info(task_info, enable_ptc=enable_ptc)
             except Exception as e:
                 logger.error(f"Failed to create env for task {task_info.get('task_name', '?')}: {e}")
                 metrics["env_creation_error"] = str(e)
@@ -485,30 +540,51 @@ class TaskSyncAgentLoop(AgentLoopBase):
                     state = AgentState.TERMINATED
 
         finally:
-            cleanup_futures = []
-            if ptc_sandbox is not None:
-                cleanup_futures.append(self.loop.run_in_executor(None, ptc_sandbox.cleanup))
-            if sandbox is not None:
-                cleanup_futures.append(self.loop.run_in_executor(None, sandbox.cleanup))
-            if cleanup_futures:
-                await asyncio.gather(*cleanup_futures, return_exceptions=True)
-            if env_dir and os.path.exists(env_dir):
-                try:
-                    await self.loop.run_in_executor(
-                        None, lambda: shutil.rmtree(env_dir, ignore_errors=True)
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup env_dir {env_dir}: {e}")
+            try:
+                cleanup_futures = []
+                if ptc_sandbox is not None:
+                    cleanup_futures.append(self.loop.run_in_executor(None, ptc_sandbox.cleanup))
+                if sandbox is not None:
+                    cleanup_futures.append(self.loop.run_in_executor(None, sandbox.cleanup))
+                if cleanup_futures:
+                    await asyncio.gather(*cleanup_futures, return_exceptions=True)
+                if env_dir and os.path.exists(env_dir):
+                    try:
+                        await self.loop.run_in_executor(
+                            None, lambda: shutil.rmtree(env_dir, ignore_errors=True)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup env_dir {env_dir}: {e}")
+                if env_dir:
+                    # Undo the sys.path entry added in _create_env_from_task_info;
+                    # otherwise dead env_dir entries accumulate forever (one per
+                    # rollout) and slow down every subsequent import.
+                    try:
+                        sys.path.remove(env_dir)
+                    except ValueError:
+                        pass
+            finally:
+                _INFLIGHT_ROLLOUTS -= 1
+                rollout_gate.release()
+                if _INFLIGHT_ROLLOUTS == 0:
+                    # End-of-step sweep (see _INFLIGHT_ROLLOUTS): force-kill any
+                    # kernel that escaped per-rollout cleanup so orphans cannot
+                    # accumulate across training steps. Safe: no episode is
+                    # active, so every tracked PID is a leak by definition;
+                    # rollouts still queued on the gate have not spawned
+                    # anything yet.
+                    kill_all_kernels()
 
         assert agent_data is not None  # for mypy
         return self._build_output(agent_data)
 
-    def _create_env_from_task_info(
-        self, task_info: dict[str, Any], enable_ptc: bool
-    ) -> TaskSyncEnvState:
-        source_path = task_info["source_path"]
-        task_name = task_info.get("task_name", os.path.basename(source_path))
+    def _prepare_env_dir(self, source_path: str, task_name: str) -> str:
+        """Blocking part of env creation: copy task files and run data.py.
 
+        Runs in an executor thread (see _create_env_from_task_info) -- it must
+        not touch Task_Env or any other thread-affine state. Returns the
+        populated env_dir; on failure the dir is removed before re-raising.
+        """
         env_dir = tempfile.mkdtemp(prefix=f"tasksync_{task_name.replace('/', '_')}_")
         try:
             for fname in _ENV_FILES:
@@ -516,8 +592,6 @@ class TaskSyncAgentLoop(AgentLoopBase):
                 if os.path.exists(src):
                     shutil.copy2(src, os.path.join(env_dir, fname))
 
-            db_path = os.path.join(env_dir, "data.db")
-            workspace = os.path.join(env_dir, "workspace")
             r = subprocess.run(
                 [sys.executable, "data.py", "--db_path", "data.db", "--workspace", "workspace"],
                 cwd=env_dir,
@@ -527,6 +601,36 @@ class TaskSyncAgentLoop(AgentLoopBase):
             )
             if r.returncode != 0:
                 raise RuntimeError(f"data.py failed for {task_name}:\n{r.stderr}")
+        except Exception:
+            shutil.rmtree(env_dir, ignore_errors=True)
+            raise
+        return env_dir
+
+    async def _create_env_from_task_info(
+        self, task_info: dict[str, Any], enable_ptc: bool
+    ) -> TaskSyncEnvState:
+        source_path = task_info["source_path"]
+        task_name = task_info.get("task_name", os.path.basename(source_path))
+
+        # The copy + data.py subprocess is the slow, blocking part. It used to
+        # run synchronously on the event loop, which stalled every other
+        # rollout on this worker (generation included) for up to
+        # data_py_timeout per rollout -- a step-start serial storm that grows
+        # linearly with group_size. Offload it to the executor and put it
+        # under the startup gate so at most VERL_SANDBOX_MAX_CONCURRENT_STARTUPS
+        # data.py builds compete with kernel bring-ups for node CPU/IO.
+        async with sandbox_startup_gate():
+            env_dir = await self.loop.run_in_executor(
+                None, self._prepare_env_dir, source_path, task_name
+            )
+
+        # Importing env.py and constructing Task_Env stay on the event-loop
+        # thread: Task_Env may hold thread-affine state (e.g. a sqlite3
+        # connection with check_same_thread=True) and is later stepped from
+        # this thread (see the correctness note in _execute_tool).
+        try:
+            db_path = os.path.join(env_dir, "data.db")
+            workspace = os.path.join(env_dir, "workspace")
 
             if env_dir not in sys.path:
                 sys.path.insert(0, env_dir)
@@ -544,6 +648,10 @@ class TaskSyncAgentLoop(AgentLoopBase):
 
         except Exception:
             shutil.rmtree(env_dir, ignore_errors=True)
+            try:
+                sys.path.remove(env_dir)
+            except ValueError:
+                pass
             raise
 
         return TaskSyncEnvState(
@@ -786,6 +894,17 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         """
         calls: list[dict[str, Any]] = []
         errors: list[str] = []
+
+        # Ignore anything emitted inside the model's reasoning block. Qwen3
+        # thinking models sometimes leak a <tool_call> into <think>...</think>;
+        # only the post-reasoning answer should drive tool execution. If a
+        # </think> terminator is present, restrict parsing to the text after the
+        # final one. Models without a reasoning block (e.g. the Coder instruct
+        # variant) have no </think>, so the full response is parsed unchanged.
+        think_close = "</think>"
+        think_end = response.rfind(think_close)
+        if think_end != -1:
+            response = response[think_end + len(think_close) :]
 
         # XML-style: strict format -- requires <tool_call>...</tool_call> wrapper,
         # with a properly closed <function=NAME>...</function> inside.
