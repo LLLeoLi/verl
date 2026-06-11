@@ -153,6 +153,42 @@ def release_rollout_slot() -> None:
     _get_rollout_sem().release()
     if _INFLIGHT_ROLLOUTS == 0:
         kill_all_kernels()
+        # Same invariant for env_dirs: with no episode active, anything still
+        # tracked is an orphan (episode cancelled before its cleanup ran, or a
+        # removal that partially failed). rmtree on the tool executor so the
+        # event loop is not blocked.
+        with _ENV_DIR_LOCK:
+            orphan_dirs = list(_TRACKED_ENV_DIRS)
+        for d in orphan_dirs:
+            _TOOL_EXECUTOR.submit(cleanup_env_dir, d)
+
+
+# Env dirs of in-flight episodes. Tracked from mkdtemp onward so that a
+# cancellation anywhere in the episode cannot leak the directory -- including
+# while data.py is still populating it on an executor thread, where the
+# rollout coroutine drops the return value and never learns the path. Anything
+# still tracked when the worker goes idle is removed by the sweep above.
+_TRACKED_ENV_DIRS: set[str] = set()
+_ENV_DIR_LOCK = threading.Lock()
+
+
+def track_env_dir(env_dir: str) -> None:
+    """Register an episode env_dir for orphan sweeping. Thread-safe."""
+    with _ENV_DIR_LOCK:
+        _TRACKED_ENV_DIRS.add(env_dir)
+
+
+def cleanup_env_dir(env_dir: str) -> None:
+    """Blocking rmtree + untrack; safe to call from any thread.
+
+    Untracks only once the directory is actually gone, so a partial removal
+    (e.g. a dying kernel still writing into its workspace) is retried by the
+    next idle sweep instead of silently leaking.
+    """
+    shutil.rmtree(env_dir, ignore_errors=True)
+    if not os.path.exists(env_dir):
+        with _ENV_DIR_LOCK:
+            _TRACKED_ENV_DIRS.discard(env_dir)
 
 
 def _set_pdeathsig(sig: int) -> None:
@@ -479,6 +515,12 @@ class StatefulSandbox:
         try:
             self._start_impl()
         except Exception:
+            # A concurrent cleanup() (rollout cancelled while start() was on
+            # an executor thread) may have set _cleaned_up mid-start, before
+            # our kernel existed -- it then had nothing to kill and will never
+            # be called again. Force this cleanup() to actually run so the
+            # kernel we may have just forked is reaped.
+            self._cleaned_up = False
             self.cleanup()
             raise
 
@@ -613,6 +655,20 @@ class StatefulSandbox:
 
         self._run(init_code)
 
+        if self._cleaned_up:
+            # cleanup() raced this start (rollout cancelled while start() was
+            # on an executor thread) and saw nothing to kill; it will never be
+            # called again for this sandbox, so reap the kernel we just
+            # started ourselves -- otherwise it survives until an idle sweep.
+            self._kill_kernel_now()
+            try:
+                client.stop_channels()
+                if client.context is not None:
+                    client.context.destroy(linger=0)
+            except Exception:
+                pass
+            raise RuntimeError("Sandbox cleanup() ran concurrently with start(); kernel reaped")
+
         if landlock_ok:
             print(f"[sandbox] Landlock ABI v{abi} active -- writes restricted to workspace.")
         else:
@@ -680,6 +736,12 @@ class StatefulSandbox:
             raise RuntimeError("Kernel was killed after a previous timeout")
         if self._proc is not None and self._proc.poll() is not None:
             self._dead = True
+            # poll() reaped the child, so the OS may recycle its PID. Stop
+            # tracking it now (same hazard as in _kill_kernel_now): if this
+            # sandbox's cleanup() never runs, a later kill_all_kernels()
+            # sweep must not SIGKILL whatever inherited the recycled PID.
+            with _PID_LOCK:
+                _SPAWNED_PIDS.discard(self._proc.pid)
             raise RuntimeError(
                 f"Kernel process has exited unexpectedly (code {self._proc.returncode})"
             )

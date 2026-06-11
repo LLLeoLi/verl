@@ -25,6 +25,7 @@ Differences vs. ``tasksync_agent_loop``:
   - Direct env tool calls are rejected with the eval.py-style error message.
 """
 import importlib.util
+import asyncio
 import json
 import logging
 import os
@@ -42,9 +43,11 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetr
 from verl.experimental.agent_loop.landlock_sandbox import (
     StatefulSandbox,
     acquire_rollout_slot,
+    cleanup_env_dir,
     get_tool_executor,
     release_rollout_slot,
     sandbox_startup_gate,
+    track_env_dir,
 )
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
 from verl.utils.profiler import simple_timer
@@ -416,18 +419,11 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
 
         finally:
             try:
-                if ptc_sandbox is not None:
-                    try:
-                        await self.loop.run_in_executor(None, ptc_sandbox.cleanup)
-                    except Exception as e:
-                        logger.warning(f"Failed to cleanup ptc_sandbox: {e}")
-                if env_dir and os.path.exists(env_dir):
-                    try:
-                        await self.loop.run_in_executor(
-                            None, lambda: shutil.rmtree(env_dir, ignore_errors=True)
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to cleanup env_dir {env_dir}: {e}")
+                # A pending cancellation aborts this finally block at its FIRST
+                # await, so everything that must happen is either done
+                # synchronously (sys.path) or already submitted to an executor
+                # (the cleanup futures below run regardless of whether the
+                # gather is ever awaited) before that point.
                 if env_dir:
                     # Undo the sys.path entry added in _create_env_from_task_info;
                     # otherwise dead env_dir entries accumulate forever (one per
@@ -436,9 +432,18 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
                         sys.path.remove(env_dir)
                     except ValueError:
                         pass
+                cleanup_futures = []
+                if ptc_sandbox is not None:
+                    cleanup_futures.append(self.loop.run_in_executor(None, ptc_sandbox.cleanup))
+                if env_dir:
+                    # cleanup_env_dir untracks only on successful removal, so a
+                    # half-removed dir is retried by the idle sweep.
+                    cleanup_futures.append(self.loop.run_in_executor(None, cleanup_env_dir, env_dir))
+                if cleanup_futures:
+                    await asyncio.gather(*cleanup_futures, return_exceptions=True)
             finally:
-                # Also sweeps orphan kernels once the worker goes idle (end of
-                # step) -- see release_rollout_slot().
+                # Also sweeps orphan kernels and env_dirs once the worker goes
+                # idle (end of step) -- see release_rollout_slot().
                 release_rollout_slot()
 
         assert agent_data is not None  # for mypy
@@ -452,6 +457,11 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
         populated env_dir; on failure the dir is removed before re-raising.
         """
         env_dir = tempfile.mkdtemp(prefix=f"tasksync_{task_name.replace('/', '_')}_")
+        # Track from creation: if the rollout coroutine is cancelled while this
+        # function is still running on its executor thread, the return value is
+        # dropped and the coroutine never learns this path -- the idle sweep
+        # (release_rollout_slot) then removes it via the tracking set.
+        track_env_dir(env_dir)
         try:
             for fname in _ENV_FILES:
                 src = os.path.join(source_path, fname)
@@ -468,7 +478,7 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
             if r.returncode != 0:
                 raise RuntimeError(f"data.py failed for {task_name}:\n{r.stderr}")
         except Exception:
-            shutil.rmtree(env_dir, ignore_errors=True)
+            cleanup_env_dir(env_dir)
             raise
         return env_dir
 
@@ -507,7 +517,7 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
                 task_prompt = f.read()
 
         except Exception:
-            shutil.rmtree(env_dir, ignore_errors=True)
+            cleanup_env_dir(env_dir)
             try:
                 sys.path.remove(env_dir)
             except ValueError:
