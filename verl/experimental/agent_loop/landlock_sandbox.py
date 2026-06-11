@@ -92,6 +92,69 @@ async def sandbox_startup_gate():
         yield
 
 
+# Cap on rollouts concurrently holding live episode resources (1-2 ipykernel
+# sandboxes each, plus the env_dir/Task_Env the agent loop attaches).
+# AgentLoopWorker.generate_sequences launches its whole chunk with
+# asyncio.gather, so without this gate the steady-state kernel population on a
+# node scales linearly with env.batch_size * env.group_size until the OOM
+# killer takes out a Ray worker or the AgentLoopWorker exhausts file
+# descriptors (~10 ZMQ fds per live rollout). The startup gate above only
+# bounds concurrent *bring-up*; this one bounds the population.
+#
+# Process-wide, i.e. PER AgentLoopWorker, and shared by every agent loop in
+# the worker -- the slot accounting below must be global so the idle sweep
+# (kill_all_kernels when in-flight hits zero) cannot fire while another loop
+# class still has live episodes. The default of 32 equals the per-worker chunk
+# of the default tasksync config (batch_size=8 * group_size=32 / num_workers=8),
+# so default runs are unaffected; larger group_size values queue instead of
+# piling up. Kernels per worker stay <= 2x this value.
+_DEFAULT_MAX_CONCURRENT_ROLLOUTS = int(
+    os.getenv("VERL_TASKSYNC_MAX_CONCURRENT_ROLLOUTS", "32")
+)
+_ROLLOUT_SEM: asyncio.Semaphore | None = None
+
+# Episodes currently holding an admission slot. Maintained on the event-loop
+# thread only (AgentLoopWorker has one loop), so plain int updates are safe.
+_INFLIGHT_ROLLOUTS = 0
+
+
+def _get_rollout_sem() -> asyncio.Semaphore:
+    """Lazily build the worker-wide rollout admission semaphore."""
+    global _ROLLOUT_SEM
+    if _ROLLOUT_SEM is None:
+        _ROLLOUT_SEM = asyncio.Semaphore(_DEFAULT_MAX_CONCURRENT_ROLLOUTS)
+    return _ROLLOUT_SEM
+
+
+async def acquire_rollout_slot() -> None:
+    """Block until this episode may hold live sandboxes (see _ROLLOUT_SEM).
+
+    Pair every successful acquire with exactly one release_rollout_slot() in a
+    finally block that runs AFTER the episode's sandbox cleanup.
+    """
+    global _INFLIGHT_ROLLOUTS
+    await _get_rollout_sem().acquire()
+    _INFLIGHT_ROLLOUTS += 1
+
+
+def release_rollout_slot() -> None:
+    """Release an admission slot; sweep orphan kernels when the worker idles.
+
+    Synchronous on purpose: it must run to completion even while the caller is
+    unwinding a CancelledError (awaits in a cancelled task's finally are
+    aborted, plain calls are not). When the in-flight count hits zero no
+    episode is active, so any PID still tracked in _SPAWNED_PIDS belongs to a
+    sandbox whose per-rollout cleanup failed or was cancelled mid-await; those
+    orphans used to accumulate monotonically across training steps until the
+    node OOMed. kill_all_kernels() is a no-op when nothing leaked.
+    """
+    global _INFLIGHT_ROLLOUTS
+    _INFLIGHT_ROLLOUTS -= 1
+    _get_rollout_sem().release()
+    if _INFLIGHT_ROLLOUTS == 0:
+        kill_all_kernels()
+
+
 def _set_pdeathsig(sig: int) -> None:
     """Best-effort: ask the kernel to deliver `sig` when our parent dies.
 
@@ -602,6 +665,14 @@ class StatefulSandbox:
                 proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 pass
+        if proc.poll() is not None:
+            # The child is reaped, so the OS may recycle its PID. Stop
+            # tracking it now: if this sandbox's cleanup() never runs (e.g.
+            # the rollout task is cancelled), a later kill_all_kernels()
+            # sweep would otherwise SIGKILL whatever unrelated process
+            # inherited the recycled PID.
+            with _PID_LOCK:
+                _SPAWNED_PIDS.discard(proc.pid)
 
     def _run(self, code: str, timeout: float | None = None) -> tuple[str, str, bool]:
         """Execute code in the kernel and return (stdout, stderr, success)."""

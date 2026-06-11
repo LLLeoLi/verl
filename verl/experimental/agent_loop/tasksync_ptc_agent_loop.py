@@ -41,7 +41,9 @@ from uuid import uuid4
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
 from verl.experimental.agent_loop.landlock_sandbox import (
     StatefulSandbox,
+    acquire_rollout_slot,
     get_tool_executor,
+    release_rollout_slot,
     sandbox_startup_gate,
 )
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
@@ -324,9 +326,14 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
         env_dir = None
         env = None
         agent_data: Optional[TaskSyncAgentData] = None
+        # Admission gate shared with TaskSyncAgentLoop: bounds how many
+        # rollouts hold live envs/sandboxes at once on this worker, so the
+        # kernel population is capped regardless of env.group_size. See
+        # landlock_sandbox.acquire_rollout_slot().
+        await acquire_rollout_slot()
         try:
             try:
-                env = self._create_env_from_task_info(task_info)
+                env = await self._create_env_from_task_info(task_info)
             except Exception as e:
                 logger.error(f"Failed to create env for task {task_info.get('task_name', '?')}: {e}")
                 metrics["env_creation_error"] = str(e)
@@ -408,26 +415,42 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
                 agent_data.final_reward = 0.0
 
         finally:
-            if ptc_sandbox is not None:
-                try:
-                    await self.loop.run_in_executor(None, ptc_sandbox.cleanup)
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup ptc_sandbox: {e}")
-            if env_dir and os.path.exists(env_dir):
-                try:
-                    await self.loop.run_in_executor(
-                        None, lambda: shutil.rmtree(env_dir, ignore_errors=True)
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup env_dir {env_dir}: {e}")
+            try:
+                if ptc_sandbox is not None:
+                    try:
+                        await self.loop.run_in_executor(None, ptc_sandbox.cleanup)
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup ptc_sandbox: {e}")
+                if env_dir and os.path.exists(env_dir):
+                    try:
+                        await self.loop.run_in_executor(
+                            None, lambda: shutil.rmtree(env_dir, ignore_errors=True)
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup env_dir {env_dir}: {e}")
+                if env_dir:
+                    # Undo the sys.path entry added in _create_env_from_task_info;
+                    # otherwise dead env_dir entries accumulate forever (one per
+                    # rollout) and slow down every subsequent import.
+                    try:
+                        sys.path.remove(env_dir)
+                    except ValueError:
+                        pass
+            finally:
+                # Also sweeps orphan kernels once the worker goes idle (end of
+                # step) -- see release_rollout_slot().
+                release_rollout_slot()
 
         assert agent_data is not None  # for mypy
         return self._build_output(agent_data)
 
-    def _create_env_from_task_info(self, task_info: dict[str, Any]) -> TaskSyncEnvState:
-        source_path = task_info["source_path"]
-        task_name = task_info.get("task_name", os.path.basename(source_path))
+    def _prepare_env_dir(self, source_path: str, task_name: str) -> str:
+        """Blocking part of env creation: copy task files and run data.py.
 
+        Runs in an executor thread (see _create_env_from_task_info) -- it must
+        not touch Task_Env or any other thread-affine state. Returns the
+        populated env_dir; on failure the dir is removed before re-raising.
+        """
         env_dir = tempfile.mkdtemp(prefix=f"tasksync_{task_name.replace('/', '_')}_")
         try:
             for fname in _ENV_FILES:
@@ -435,8 +458,6 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
                 if os.path.exists(src):
                     shutil.copy2(src, os.path.join(env_dir, fname))
 
-            db_path = os.path.join(env_dir, "data.db")
-            workspace = os.path.join(env_dir, "workspace")
             r = subprocess.run(
                 [sys.executable, "data.py", "--db_path", "data.db", "--workspace", "workspace"],
                 cwd=env_dir,
@@ -446,6 +467,30 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
             )
             if r.returncode != 0:
                 raise RuntimeError(f"data.py failed for {task_name}:\n{r.stderr}")
+        except Exception:
+            shutil.rmtree(env_dir, ignore_errors=True)
+            raise
+        return env_dir
+
+    async def _create_env_from_task_info(self, task_info: dict[str, Any]) -> TaskSyncEnvState:
+        source_path = task_info["source_path"]
+        task_name = task_info.get("task_name", os.path.basename(source_path))
+
+        # See TaskSyncAgentLoop._create_env_from_task_info: the copy + data.py
+        # subprocess is blocking, so run it in the executor (under the startup
+        # gate) instead of stalling the worker event loop.
+        async with sandbox_startup_gate():
+            env_dir = await self.loop.run_in_executor(
+                None, self._prepare_env_dir, source_path, task_name
+            )
+
+        # Importing env.py and constructing Task_Env stay on the event-loop
+        # thread: Task_Env may hold thread-affine state (e.g. a sqlite3
+        # connection with check_same_thread=True) and is later stepped from
+        # this thread.
+        try:
+            db_path = os.path.join(env_dir, "data.db")
+            workspace = os.path.join(env_dir, "workspace")
 
             if env_dir not in sys.path:
                 sys.path.insert(0, env_dir)
@@ -463,6 +508,10 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
 
         except Exception:
             shutil.rmtree(env_dir, ignore_errors=True)
+            try:
+                sys.path.remove(env_dir)
+            except ValueError:
+                pass
             raise
 
         return TaskSyncEnvState(

@@ -45,8 +45,9 @@ from uuid import uuid4
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
 from verl.experimental.agent_loop.landlock_sandbox import (
     StatefulSandbox,
+    acquire_rollout_slot,
     get_tool_executor,
-    kill_all_kernels,
+    release_rollout_slot,
     sandbox_startup_gate,
 )
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
@@ -64,52 +65,6 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 # trajectory. Heavy envs finish in <10s uncontended; 60s leaves margin under
 # concurrency without masking a genuinely hung kernel.
 _SANDBOX_SETUP_TIMEOUT = float(os.getenv("VERL_SANDBOX_SETUP_TIMEOUT", "60.0"))
-
-# Cap on rollouts concurrently holding live episode resources: an env_dir with
-# its sqlite db, an in-process Task_Env, and 1-2 ipykernel sandboxes.
-#
-# AgentLoopWorker.generate_sequences launches its WHOLE chunk with
-# asyncio.gather, so without this gate the steady-state population of live
-# kernels on a node scales linearly with env.batch_size * env.group_size:
-#   kernels/node ~= 2 * batch_size * group_size / nnodes   (ptc mode)
-# Raising group_size therefore grows the node's resident-kernel count without
-# bound until the OOM killer takes out a Ray worker, or the AgentLoopWorker
-# process exhausts file descriptors (~10 ZMQ fds per live rollout). The
-# sandbox_startup_gate only bounds concurrent *bring-up*, not the steady-state
-# population -- this gate bounds the population.
-#
-# The gate is process-wide, i.e. PER AgentLoopWorker. The default of 32 equals
-# the per-worker chunk size of the default config (batch_size=8 * group_size=32
-# / num_workers=8), so default runs are unaffected; larger group_size values
-# queue instead of piling up. Tune via VERL_TASKSYNC_MAX_CONCURRENT_ROLLOUTS;
-# kernels per worker stay <= 2x this value.
-_DEFAULT_MAX_CONCURRENT_ROLLOUTS = int(
-    os.getenv("VERL_TASKSYNC_MAX_CONCURRENT_ROLLOUTS", "32")
-)
-_ROLLOUT_SEM: asyncio.Semaphore | None = None
-
-# Episodes currently inside the admission gate on this worker. Maintained on
-# the event-loop thread only (no locking needed). When it drops to zero --
-# i.e. at the end of a generation step -- any kernel PID still tracked by
-# landlock_sandbox belongs to a sandbox whose per-rollout cleanup failed or
-# was cancelled mid-await (task cancellation aborts the awaits in run()'s
-# finally block). Those orphans used to accumulate monotonically across steps
-# until the node OOMed and the raylet was SIGKILLed; the end-of-step
-# kill_all_kernels() sweep in run() reaps them. It is a no-op when nothing
-# leaked.
-_INFLIGHT_ROLLOUTS = 0
-
-
-def _get_rollout_sem() -> asyncio.Semaphore:
-    """Lazily build the worker-wide live-rollout admission semaphore.
-
-    Bound to the running event loop on first call. Safe under single-threaded
-    asyncio (AgentLoopWorker has one event loop), no extra locking needed.
-    """
-    global _ROLLOUT_SEM
-    if _ROLLOUT_SEM is None:
-        _ROLLOUT_SEM = asyncio.Semaphore(_DEFAULT_MAX_CONCURRENT_ROLLOUTS)
-    return _ROLLOUT_SEM
 
 
 # ============================================================================
@@ -443,13 +398,11 @@ class TaskSyncAgentLoop(AgentLoopBase):
         env = None
         agent_data: Optional[TaskSyncAgentData] = None
         # Admission gate: bounds how many rollouts hold live envs/sandboxes at
-        # once on this worker (see _get_rollout_sem). Held for the whole
-        # episode and released after cleanup, so the kernel population -- not
-        # just bring-up -- is capped regardless of env.group_size.
-        rollout_gate = _get_rollout_sem()
-        await rollout_gate.acquire()
-        global _INFLIGHT_ROLLOUTS
-        _INFLIGHT_ROLLOUTS += 1
+        # once on this worker (see landlock_sandbox.acquire_rollout_slot).
+        # Held for the whole episode and released after cleanup, so the kernel
+        # population -- not just bring-up -- is capped regardless of
+        # env.group_size.
+        await acquire_rollout_slot()
         try:
             try:
                 env = await self._create_env_from_task_info(task_info, enable_ptc=enable_ptc)
@@ -564,16 +517,9 @@ class TaskSyncAgentLoop(AgentLoopBase):
                     except ValueError:
                         pass
             finally:
-                _INFLIGHT_ROLLOUTS -= 1
-                rollout_gate.release()
-                if _INFLIGHT_ROLLOUTS == 0:
-                    # End-of-step sweep (see _INFLIGHT_ROLLOUTS): force-kill any
-                    # kernel that escaped per-rollout cleanup so orphans cannot
-                    # accumulate across training steps. Safe: no episode is
-                    # active, so every tracked PID is a leak by definition;
-                    # rollouts still queued on the gate have not spawned
-                    # anything yet.
-                    kill_all_kernels()
+                # Also sweeps orphan kernels once the worker goes idle (end of
+                # step) -- see release_rollout_slot().
+                release_rollout_slot()
 
         assert agent_data is not None  # for mypy
         return self._build_output(agent_data)
