@@ -47,6 +47,7 @@ from verl.experimental.agent_loop.landlock_sandbox import (
     get_tool_executor,
     release_rollout_slot,
     sandbox_startup_gate,
+    teardown_env,
     track_env_dir,
 )
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
@@ -432,6 +433,12 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
                         sys.path.remove(env_dir)
                     except ValueError:
                         pass
+                # Break the Task_Env reference cycle synchronously (before the
+                # first await below, which a pending cancellation would abort)
+                # so its memory -- and the env module namespace its tools pin --
+                # is reclaimed by refcounting instead of leaking until a cyclic
+                # GC pass. See landlock_sandbox.teardown_env.
+                teardown_env(env)
                 cleanup_futures = []
                 if ptc_sandbox is not None:
                     cleanup_futures.append(self.loop.run_in_executor(None, ptc_sandbox.cleanup))

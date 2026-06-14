@@ -18,6 +18,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import ctypes
+import gc
 import os
 import re
 import resource
@@ -161,6 +162,15 @@ def release_rollout_slot() -> None:
             orphan_dirs = list(_TRACKED_ENV_DIRS)
         for d in orphan_dirs:
             _TOOL_EXECUTOR.submit(cleanup_env_dir, d)
+        # Reclaim reference cycles now that no episode is active. Each rollout's
+        # Task_Env is a self-referential cycle (Task_Env.tools holds bound
+        # methods of the Task_Env, whose __globals__ pin the whole exec'd env
+        # module namespace) so it -- and any large module-level data env.py
+        # loaded -- is freed only by the cyclic collector, never by refcounting.
+        # teardown_env() breaks the cycle per rollout, but a cancellation can
+        # skip that; collecting at idle (once per step) keeps the cyclic-garbage
+        # backlog from growing without bound across steps until the node OOMs.
+        gc.collect()
 
 
 # Env dirs of in-flight episodes. Tracked from mkdtemp onward so that a
@@ -189,6 +199,54 @@ def cleanup_env_dir(env_dir: str) -> None:
     if not os.path.exists(env_dir):
         with _ENV_DIR_LOCK:
             _TRACKED_ENV_DIRS.discard(env_dir)
+
+
+def teardown_env(env) -> None:
+    """Release a finished episode's Task_Env so its memory is reclaimed now.
+
+    The agent loops construct a fresh user ``Task_Env`` per rollout (tens of
+    thousands per run). That object is a reference cycle -- ``task_env.tools``
+    maps each tool name to a *bound method* of ``task_env``, and every bound
+    method keeps ``task_env`` alive (``__self__``) *and* pins the entire exec'd
+    env-module namespace (``__func__.__globals__``), which may include large
+    objects env.py loaded at import time (DataFrames, parsed datasets, ...).
+    Because of the cycle none of this is freed by refcounting when the rollout
+    returns; it survives until the cyclic collector happens to run. Under
+    per-rollout churn plus the node's Megatron CPU-offload pressure that
+    backlog grows until the OOM killer takes out a worker.
+
+    Breaking the cycle here (clearing ``tools`` and dropping ``env``'s handles)
+    makes the Task_Env, its class, and the module namespace collectable by
+    refcounting immediately. Best-effort and exception-safe: it runs on the
+    episode's cleanup path, which must not raise. Idempotent.
+    """
+    if env is None:
+        return
+    task_env = getattr(env, "task_env", None)
+    if task_env is not None:
+        # Defensive: let envs that hold a persistent handle (sqlite connection,
+        # open file, ...) release it. Most envs open/close per tool call and
+        # expose no closer; that is fine.
+        for closer in ("close", "cleanup"):
+            fn = getattr(task_env, closer, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:
+                    pass
+                break
+        tools = getattr(task_env, "tools", None)
+        if isinstance(tools, dict):
+            tools.clear()
+    # Drop every back-reference the episode held so the chain collapses under
+    # refcounting. setattr is guarded because the env-state dataclasses differ
+    # slightly between agent loops (e.g. only the PTC loop omits `sandbox`).
+    for attr in ("task_env", "sandbox", "ptc_sandbox", "terminal_executor"):
+        if hasattr(env, attr):
+            try:
+                setattr(env, attr, None)
+            except Exception:
+                pass
 
 
 def _set_pdeathsig(sig: int) -> None:
