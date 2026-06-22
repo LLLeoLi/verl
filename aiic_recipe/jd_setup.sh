@@ -109,15 +109,14 @@ PIPC=("${PIP[@]}" -c "${CONSTRAINTS}")
     "llguidance<1.4.0,>=1.3.0"
 
 # ----------------------------------------------------------------------------
-# 3. wandb / protobuf. megatron-core's megatron/core/timers.py does
-#    `import wandb` at module top, so `import megatron.core` (step 4 + verify)
-#    needs a working wandb + a protobuf its pb2 files agree with. Pin the same
-#    known-good pair the old recipe used. Done LAST among python deps because
-#    logfire/etc. otherwise bump protobuf to 6.x.
-# ----------------------------------------------------------------------------
-pip uninstall -y wandb || true
-"${PIPC[@]}" "wandb==0.16.6"
-"${PIPC[@]}" "protobuf==4.25.3"
+# 3. wandb / protobuf: DO NOT downgrade on the jd image.
+#    The old Arnold recipe forced wandb==0.16.6 + protobuf==4.25.3 to dodge
+#    byted-wandb's broken pb2. The jd image has none of that: it's a modern
+#    NVIDIA stack where megatron-bridge needs wandb>=0.19.10 and
+#    grpc/opentelemetry/sglang need protobuf>=6.31.1. Modern megatron-core has
+#    no pb2 problem, so we keep the image's versions untouched. (If a stale run
+#    already pinned them down, restore with:
+#    pip install -U "protobuf>=6.31.1,<7" "wandb>=0.19.10")
 
 # ----------------------------------------------------------------------------
 # 4. Megatron-core -> upstream main.
@@ -130,6 +129,12 @@ pip uninstall -y wandb || true
 MEGATRON_REF="main"
 pip uninstall -y megatron-core || true
 "${PIP[@]}" --no-deps "git+https://github.com/NVIDIA/Megatron-LM.git@${MEGATRON_REF}"
+
+# megatron-core main asserts nvidia-resiliency-ext>=0.6.0 at import
+# (dist_checkpointing/strategies/nvrx.py). The image ships an older one, so
+# bump it. 0.6.0 only needs torch>=2.3.0 (no upper pin) -> torch stays put.
+"${PIPC[@]}" -U "nvidia-resiliency-ext>=0.6.0"
+
 python3 -c "import megatron.core as m; print('megatron-core:', m.__version__, m.__file__)"
 
 # ----------------------------------------------------------------------------
