@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 # export VLLM_NO_USAGE_STATS=1
 # export TMPDIR="/ssddata/lihao/tmp"
 # mkdir -p "${TMPDIR}"
@@ -24,19 +24,22 @@ export VLLM_CACHE_ROOT="${CACHE_ROOT}/vllm"
 export XDG_CACHE_HOME="${CACHE_ROOT}"
 mkdir -p "${FLASHINFER_WORKSPACE_BASE}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${VLLM_CACHE_ROOT}"
 
-MODEL_PATH="/ssddata/lihao/projects/models/Qwen3.5-9B-ptc-SFT"
+MODEL_PATH="/ssddata/lihao/projects/models/Qwen3.5-9B"
 PORT=18025
-TP=8
+TP=1
+DP=4
 
 echo "Starting vLLM server..."
 echo "  Model:  ${MODEL_PATH}"
 echo "  Port:   ${PORT}"
 echo "  TP:     ${TP}"
-echo "  GPUs:   ${CUDA_VISIBLE_DEVICES}"
-
+echo "  DP:     ${DP}"
 vllm serve "${MODEL_PATH}" \
     --served-model-name "Qwen3.5-9B" \
     --tensor-parallel-size "${TP}" \
+    --data-parallel-size "${DP}" \
+    --gpu-memory-utilization 0.90 \
     --port "${PORT}" \
     --enable-auto-tool-choice \
-    --tool-call-parser qwen3_xml
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3

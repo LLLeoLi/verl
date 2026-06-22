@@ -68,7 +68,7 @@ _PR_SET_PDEATHSIG = 1
 # without the contention. Tune up only if bring-up latency dominates and the
 # node has spare CPU/RAM.
 _DEFAULT_MAX_CONCURRENT_STARTUPS = int(
-    os.getenv("VERL_SANDBOX_MAX_CONCURRENT_STARTUPS", "4")
+    os.getenv("VERL_SANDBOX_MAX_CONCURRENT_STARTUPS", "16")
 )
 _STARTUP_SEM: asyncio.Semaphore | None = None
 
