@@ -87,6 +87,21 @@ if [ -n "${JD_WHEELHOUSE}" ]; then
     FIND_LINKS=(--find-links "${JD_WHEELHOUSE}")
     echo "jd_setup: using wheelhouse ${JD_WHEELHOUSE}"
 fi
+# OFFLINE install args: pip uses ONLY the wheelhouse, never the network. This is
+# what actually prevents re-downloads. `--find-links DIR` alone does NOT make pip
+# prefer the staged wheel — with an index configured pip re-pulls the same
+# version (and `--force-reinstall`/`-U` re-pull every run). `--no-index` forces
+# the local file. Use "${PIP_OFFLINE[@]}" instead of "${FIND_LINKS[@]}" whenever
+# the needed wheel is staged. Empty when no wheelhouse (callers fall back online).
+PIP_OFFLINE=()
+[ -n "${JD_WHEELHOUSE}" ] && PIP_OFFLINE=(--no-index --find-links "${JD_WHEELHOUSE}")
+# jd_have_wheels GLOB... -> 0 iff every glob matches a file in the wheelhouse.
+jd_have_wheels() {
+    [ -n "${JD_WHEELHOUSE}" ] || return 1
+    local g
+    for g in "$@"; do compgen -G "${JD_WHEELHOUSE}/${g}" >/dev/null || return 1; done
+    return 0
+}
 # Seed the wheelhouse with any matching wheels pip just built into its cache.
 jd_persist_wheels() {
     [ -n "${JD_WHEELHOUSE}" ] || return 0
@@ -195,8 +210,11 @@ elif [ "${FA_TRY_PREBUILT:-0}" = "1" ] \
      && "${PIP[@]}" --no-deps --force-reinstall "${FA_WHEEL}" \
      && python3 -c "import flash_attn" 2>/dev/null; then
     echo "flash-attn: torch2.9 prebuilt wheel imports on torch 2.11 — using it (no build)."
+elif jd_have_wheels "flash_attn-${FA_VER}-*.whl"; then
+    echo "flash-attn: installing ${FA_VER} from wheelhouse (offline, no rebuild)."
+    "${PIPC[@]}" "${PIP_OFFLINE[@]}" --force-reinstall --no-deps "flash-attn==${FA_VER}"
 else
-    echo "flash-attn: installing ${FA_VER} (prebuilt from wheelhouse if present, else build sm_${GPU_ARCH})..."
+    echo "flash-attn: no wheel staged — building ${FA_VER} for sm_${GPU_ARCH}..."
     FLASH_ATTN_CUDA_ARCHS="${GPU_ARCH}" \
         "${PIPC[@]}" "${FIND_LINKS[@]}" --no-build-isolation --force-reinstall --no-deps \
         "flash-attn==${FA_VER}"
@@ -228,6 +246,16 @@ except Exception:
 PY
 then
     echo "transformer-engine: already ${TE_VER} (all 3 subpkgs) and imports — skipping."
+elif jd_have_wheels "transformer_engine-${TE_VER}-*.whl" \
+                    "transformer_engine_cu12-${TE_VER}-*.whl" \
+                    "transformer_engine_torch-${TE_VER}-*.whl"; then
+    # All three prebuilt wheels are staged (incl. the 288MB cu12) — install them
+    # OFFLINE so the heavy wheel is never re-pulled from the index.
+    echo "transformer-engine: installing all 3 subpkgs ${TE_VER} from wheelhouse (offline)."
+    "${PIPC[@]}" "${PIP_OFFLINE[@]}" --no-deps --force-reinstall \
+        "transformer-engine==${TE_VER}" \
+        "transformer-engine-cu12==${TE_VER}" \
+        "transformer-engine-torch==${TE_VER}"
 else
     NVTE_CUDA_ARCHS="${GPU_ARCH}" "${PIPC[@]}" "${FIND_LINKS[@]}" \
         --no-build-isolation --no-deps --force-reinstall \
@@ -257,8 +285,13 @@ python3 -c "import transformer_engine.pytorch as te;print('transformer-engine: O
 "${PIPC[@]}" --upgrade huggingface_hub jupyter_client ipykernel
 
 # cupy/fastrlock for the NCCL checkpoint engine (cu12x matches the 12.9 stack).
-# cupy-cuda12x is a ~108MB wheel — prefer the wheelhouse copy.
-"${PIPC[@]}" "${FIND_LINKS[@]}" "cupy-cuda12x>=13,<14" --no-deps
+# cupy-cuda12x is a ~108MB wheel — install the staged copy OFFLINE (a plain
+# --find-links range would let pip pull a newer 13.x from the index instead).
+if jd_have_wheels "cupy_cuda12x-*.whl"; then
+    "${PIPC[@]}" "${PIP_OFFLINE[@]}" "cupy-cuda12x" --no-deps
+else
+    "${PIPC[@]}" "${FIND_LINKS[@]}" "cupy-cuda12x>=13,<14" --no-deps
+fi
 jd_persist_wheels 'cupy_cuda12x-*.whl'
 "${PIPC[@]}" fastrlock
 
@@ -357,7 +390,13 @@ python3 -c "import megatron.core as m;print('megatron-core:',m.__version__,m.__f
 #    Qwen3.5 HF weights into Megatron. fla-core / tilelang are already provided
 #    by the image (+ vLLM deps); do NOT reinstall flash-linear-attention.
 # ----------------------------------------------------------------------------
-"${PIPC[@]}" "${FIND_LINKS[@]}" 'mcore-bridge>=1.0.2' -U
+# Install the staged mbridge OFFLINE; a plain `--find-links ... -U` would let pip
+# upgrade to a newer release from the index every run (re-download).
+if jd_have_wheels "mcore_bridge-*.whl"; then
+    "${PIPC[@]}" "${PIP_OFFLINE[@]}" 'mcore-bridge' -U
+else
+    "${PIPC[@]}" "${FIND_LINKS[@]}" 'mcore-bridge>=1.0.2' -U
+fi
 jd_persist_wheels 'mcore_bridge-*.whl'
 
 # Patch 1: drop the cp_comm_type="p2p" kwarg from the Qwen3.5 VL bridge that the
