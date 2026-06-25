@@ -264,6 +264,18 @@ else
         "transformer-engine-torch==${TE_VER}"
     jd_persist_wheels 'transformer_engine_torch-*.whl'   # seed wheelhouse if built
 fi
+# transformer-engine-torch declares onnxscript/onnx/einops/pydantic as runtime
+# deps, but we install the trio with --no-deps (to freeze torch/cu12). On images
+# that lack onnxscript, `import transformer_engine.pytorch` dies with
+# "ModuleNotFoundError: No module named 'onnxscript'" (export.py imports it
+# unconditionally). Pull these small pure-python deps explicitly; constraints
+# keep torch pinned. Prefer the staged wheels offline when present.
+if jd_have_wheels "onnxscript-*.whl"; then
+    "${PIPC[@]}" "${PIP_OFFLINE[@]}" onnxscript onnx-ir
+else
+    "${PIPC[@]}" "${FIND_LINKS[@]}" onnxscript
+fi
+jd_persist_wheels 'onnxscript-*.whl'; jd_persist_wheels 'onnx_ir-*.whl'
 python3 -c "import transformer_engine.pytorch as te;print('transformer-engine: OK')"
 
 # ----------------------------------------------------------------------------
