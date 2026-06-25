@@ -263,15 +263,28 @@ jd_persist_wheels 'cupy_cuda12x-*.whl'
 "${PIPC[@]}" fastrlock
 
 # ----------------------------------------------------------------------------
-# 4. vLLM 0.20.0 (rollout backend).
-#    Install WITH deps so pip resolves vLLM's full (and large, fast-moving)
-#    dependency set correctly — flashinfer-python==0.6.8.post1,
-#    compressed-tensors==0.15.0.1, numba==0.65.0, xgrammar, tilelang, etc.
-#    The constraints file freezes the torch trio so none of that drags torch.
-#    (This replaces the old, error-prone hand-maintained --no-deps list.)
-#    --find-links pulls the big prebuilt vllm / flashinfer wheels straight from
-#    the wheelhouse; the small pure-python deps still resolve from the index.
+# 4. vLLM 0.20.0 (rollout backend) — the +cu129 build.
+#    CRITICAL: the PyPI default vllm-0.20.0 wheel is built for CUDA 13 (its
+#    compiled .so link libcudart.so.13) and fails on this cu12.9 stack with
+#    "ImportError: libcudart.so.13: cannot open shared object file". vLLM ships
+#    a matching CUDA-12.9 wheel on its GitHub release
+#    (vllm-0.20.0+cu129-...manylinux_2_31), so we install THAT explicitly, then
+#    resolve vLLM's pure-python deps from the index (the +cu129 wheel already
+#    satisfies `vllm==0.20.0`, so this only pulls the small deps and leaves the
+#    cu129 build in place). flashinfer-python/cubin (cu12) come along here.
 # ----------------------------------------------------------------------------
+VLLM_WHEEL="vllm-0.20.0+cu129-cp38-abi3-manylinux_2_31_x86_64.whl"
+VLLM_GH_URL="https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0%2Bcu129-cp38-abi3-manylinux_2_31_x86_64.whl"
+if python3 -c "import importlib.metadata as m,sys; sys.exit(0 if '+cu129' in m.version('vllm') else 1)" 2>/dev/null; then
+    echo "vllm: already the +cu129 build — ok."
+elif [ -n "${JD_WHEELHOUSE}" ] && [ -f "${JD_WHEELHOUSE}/${VLLM_WHEEL}" ]; then
+    echo "vllm: installing +cu129 wheel from wheelhouse (offline)."
+    "${PIPC[@]}" --no-index --no-deps --force-reinstall "${JD_WHEELHOUSE}/${VLLM_WHEEL}"
+else
+    echo "vllm: installing +cu129 wheel from vLLM GitHub release."
+    "${PIPC[@]}" --no-deps --force-reinstall "${VLLM_GH_URL}"
+fi
+# Resolve vLLM's deps (vllm already satisfied at 0.20.0+cu129, only deps fetched).
 "${PIPC[@]}" "${FIND_LINKS[@]}" "vllm==0.20.0"
 jd_persist_wheels 'vllm-*.whl'
 jd_persist_wheels 'flashinfer_*-*.whl'
