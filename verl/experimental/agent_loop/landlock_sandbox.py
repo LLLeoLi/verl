@@ -181,13 +181,7 @@ async def sandbox_startup_gate():
 # Process-wide, i.e. PER AgentLoopWorker, and shared by every agent loop in
 # the worker -- the slot accounting below must be global so the idle sweep
 # (kill_all_kernels when in-flight hits zero) cannot fire while another loop
-# class still has live episodes. The default of 32 equals the per-worker chunk
-# of the default tasksync config (batch_size=8 * group_size=32 / num_workers=8),
-# so default runs are unaffected; larger group_size values queue instead of
-# piling up. Kernels per worker stay <= 2x this value.
-_DEFAULT_MAX_CONCURRENT_ROLLOUTS = int(
-    os.getenv("VERL_TASKSYNC_MAX_CONCURRENT_ROLLOUTS", "32")
-)
+_DEFAULT_MAX_CONCURRENT_ROLLOUTS = 64
 _ROLLOUT_SEM: asyncio.Semaphore | None = None
 
 # Episodes currently holding an admission slot. Maintained on the event-loop

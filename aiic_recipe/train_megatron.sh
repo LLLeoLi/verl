@@ -34,7 +34,7 @@ while [[ "$#" -gt 0 ]]; do
         --response_len) response_len="$2"; shift 2 ;;
         --env_batch_size) env_batch_size="$2"; shift 2 ;;
         --env_group_size) env_group_size="$2"; shift 2 ;;
-        --ppo_micro_bsz_per_gpu) ppo_micro_bsz_per_gpu="$2"; shift 2 ;;
+        --max_num_batched_tokens) max_num_batched_tokens="$2"; shift 2 ;;
         --temperature) temperature="$2"; shift 2 ;;
         --clip_ratio_high) clip_ratio_high="$2"; shift 2 ;;
         --total_epochs) total_epochs="$2"; shift 2 ;;
@@ -98,7 +98,6 @@ env_batch_size=${env_batch_size:-8}
 env_group_size=${env_group_size:-32}
 ppo_mini_bsz=$((env_batch_size * env_group_size))
 
-ppo_micro_bsz_per_gpu=${ppo_micro_bsz_per_gpu:-4}
 temperature=${temperature:-1.0}
 clip_ratio_high=${clip_ratio_high:-0.28}
 total_epochs=${total_epochs:-5}
@@ -133,6 +132,9 @@ offload=${offload:-True}
 offload_fraction=${offload_fraction:-1.0}
 use_mbridge=${use_mbridge:-True}
 gpu_memory_utilization=${gpu_memory_utilization:-0.8}
+# vLLM single-step token budget (prefill+decode). 4x the verl default (8192) to
+# help long-context prefill throughput, at the cost of activation memory.
+max_num_batched_tokens=${max_num_batched_tokens:-32768}
 num_workers=${num_workers:-8}
 save_freq=${save_freq:-25}
 dump_experience_every=${dump_experience_every:-1}
@@ -163,7 +165,7 @@ suffix_str=""
 if [ -n "${suffix}" ]; then
     suffix_str="-${suffix}"
 fi
-exp_name=${exp_name:-"${DATE}-${loss_mode}-tp${actor_tp}-pp${actor_pp}-cp${actor_cp}-ep${actor_ep}-etp${actor_etp}-bsz${ppo_micro_bsz_per_gpu}-total_epochs${total_epochs}-group_size${env_group_size}-reward_type${reward_type}${dense_epoch_suffix}${suffix_str}"}
+exp_name=${exp_name:-"${DATE}-${loss_mode}-tp${actor_tp}-pp${actor_pp}-cp${actor_cp}-ep${actor_ep}-etp${actor_etp}-total_epochs${total_epochs}-group_size${env_group_size}-reward_type${reward_type}${dense_epoch_suffix}${suffix_str}"}
 ckpt_root=${ckpt_root:-"/mnt/public_02/lihao/ptc-checkpoints/${exp_name}"}
 
 echo "${exp_name}"
@@ -200,9 +202,9 @@ TRAIN_CMD=(
     actor_rollout_ref.rollout.max_model_len=${total_len}
     actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp}
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization}
+    actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens}
     actor_rollout_ref.rollout.agent.default_agent_loop=${agent_loop}
     actor_rollout_ref.rollout.agent.num_workers=${num_workers}
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${ppo_micro_bsz_per_gpu}
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${max_token_len_per_gpu}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.free_cache_engine=${offload}
@@ -210,7 +212,6 @@ TRAIN_CMD=(
 
     # actor training
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_bsz}
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_bsz_per_gpu}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${max_token_len_per_gpu}
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high}
