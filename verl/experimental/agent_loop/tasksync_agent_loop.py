@@ -434,7 +434,16 @@ class TaskSyncAgentLoop(AgentLoopBase):
                     return self._build_early_termination_output(request_id, metrics)
 
                 if enable_ptc:
-                    ptc_sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
+                    # The PTC kernel's setup_code imports env.py and opens
+                    # data.db (both under env_dir), so env_dir must be readable
+                    # inside its bwrap mount namespace. The main sandbox above
+                    # gets no extra_read_paths, so agent code there cannot read
+                    # the task's data.db / answers.
+                    ptc_sandbox = StatefulSandbox(
+                        workspace_path=env.workspace,
+                        timeout=10.0,
+                        extra_read_paths=[env.env_dir],
+                    )
                     try:
                         await self.loop.run_in_executor(None, ptc_sandbox.start)
                     except Exception as e:
@@ -1185,6 +1194,17 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             "tool_call_parse_error_count": agent_data.tool_call_parse_error_count,
         }
         output.extra_fields["messages"] = agent_data.messages
+
+        logger.info(
+            "[rollout] task=%s reward=%.4f (raw=%.4f) success=%s turns=%d len=%d%s",
+            getattr(agent_data.env, "task_name", "?"),
+            penalized_reward,
+            float(agent_data.final_reward),
+            agent_data.success,
+            agent_data.assistant_turns,
+            rollout_length,
+            " [truncated]" if is_truncated else "",
+        )
 
         return output
 

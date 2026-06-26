@@ -5,13 +5,23 @@ Variables, imports, and other state persist across execute() calls within
 the same sandbox instance, enabling multi-turn code execution.
 
 Isolation strategy (layered):
-  1. Linux Landlock (kernel >= 5.13, no root required) -- applied in the kernel
-     child process via preexec_fn.  Grants read+execute everywhere, but
-     confines ALL writes (including from subprocess calls made by user code)
-     to the workspace directory and a private tmpdir.
-  2. Python-level open() guard -- defense-in-depth for write attempts that
-     happen to go through the built-in open(); also covers the case where
-     Landlock is unavailable.
+  1. bubblewrap (bwrap), when available -- the PRIMARY fs layer. The kernel runs
+     in a mount namespace with DEFAULT-DENY reads: only an allowlist of system
+     dirs plus the rollout's own paths (workspace, env_dir, tmpdir) are visible;
+     /tmp is a fresh tmpfs so sibling rollouts' env_dirs (and their data.db /
+     answers), /mnt model weights, /root, etc. are invisible. Writes stay
+     confined to the workspace + private /tmp & /dev/shm + tmpdir. Network is
+     NOT isolated. Disable with VERL_SANDBOX_USE_BWRAP=0.
+  2. Linux Landlock (kernel >= 5.13, no root required) -- FALLBACK when bwrap is
+     unavailable. Applied in the kernel child via preexec_fn. Grants
+     read+execute everywhere, but confines ALL writes (including subprocess
+     calls made by user code) to the workspace and a private tmpdir.
+  3. cgroup v2 leaf per kernel (when writable) -- the memory cap: aggregate
+     memory.max + pids.max over the whole {bwrap -> kernel -> children} subtree.
+     A per-process RLIMIT_AS in preexec is only a fallback for when the cgroup is
+     unavailable (never stacked: AS over-counts mmap and false-positives).
+  4. Python-level open() guard -- defense-in-depth for write-mode built-in
+     open() calls outside the workspace.
 """
 
 import asyncio
@@ -19,6 +29,7 @@ import concurrent.futures
 import contextlib
 import ctypes
 import gc
+import logging
 import os
 import re
 import resource
@@ -31,10 +42,75 @@ import threading
 import time
 from pathlib import Path
 
-# Default per-kernel address-space cap (bytes). Override via the
-# `mem_limit_bytes` kwarg to StatefulSandbox or the
-# VERL_SANDBOX_MEM_LIMIT_BYTES env var. 0 disables the cap.
-_DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_SANDBOX_MEM_LIMIT_BYTES", str(8 * 1024**3)))
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+# Keys already logged by _log_once, so repeated identical messages (e.g. the
+# per-sandbox confinement mode, which is the same for every kernel in a worker)
+# are emitted only ONCE per process instead of spamming the log every start.
+_LOGGED_ONCE: set[str] = set()
+_LOG_ONCE_LOCK = threading.Lock()
+
+
+def _log_once(key: str, level: int, msg: str) -> None:
+    """Emit `msg` at `level` the first time `key` is seen in this process."""
+    with _LOG_ONCE_LOCK:
+        if key in _LOGGED_ONCE:
+            return
+        _LOGGED_ONCE.add(key)
+    logger.log(level, msg)
+
+
+# Default per-kernel memory cap (bytes). Seeds the cgroup memory.max default
+# (the primary cap, see cgroup_mem_max below) and the fallback RLIMIT_AS used
+# only when the cgroup is unavailable. Override via the `mem_limit_bytes` kwarg
+# to StatefulSandbox or the VERL_SANDBOX_MEM_LIMIT_BYTES env var. 0 disables it.
+# 4GiB is generous for the lightweight tasksync tool sandboxes.
+_DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_SANDBOX_MEM_LIMIT_BYTES", str(4 * 1024**3)))
+
+# --- bubblewrap (bwrap) filesystem confinement -----------------------------
+# When bwrap is on the PATH it becomes the PRIMARY fs-confinement layer. Reads
+# are default-DENY: only an allowlist of system dirs (read-only) plus this
+# rollout's own paths are visible. Everything else is invisible -- /mnt model
+# weights & checkpoints, /root, and crucially OTHER rollouts' env_dirs (each a
+# tempfile.mkdtemp under /tmp holding that task's data.db / answers): /tmp is
+# remounted as a fresh tmpfs and only the caller's workspace / env_dir / tmpdir
+# are bound back over it. Writes stay confined to the workspace + a private
+# /tmp & /dev/shm + the kernel tmpdir (the same set Landlock enforced). Network
+# is intentionally NOT isolated (kernel<->client ZMQ uses 127.0.0.1 and rollouts
+# may need outbound access).
+#
+# Set VERL_SANDBOX_USE_BWRAP=0 to fall back to the Landlock path. bwrap and
+# Landlock are not stacked: bwrap's fresh /tmp & /dev/shm tmpfs aren't in a
+# host-built Landlock allowlist, so a Landlock ruleset would wrongly block them.
+_BWRAP_BIN = shutil.which("bwrap")
+_USE_BWRAP = os.getenv("VERL_SANDBOX_USE_BWRAP", "1") != "0" and _BWRAP_BIN is not None
+# Read-only system dirs the kernel needs to run Python + user code (imports,
+# shared libs, certs, system tools). Colon-separated; missing paths are skipped
+# (--ro-bind-try). Set to "/" to expose the whole root read-only (old behaviour).
+_BWRAP_READ_PATHS = [
+    p
+    for p in os.getenv(
+        "VERL_SANDBOX_BWRAP_READ_PATHS",
+        "/usr:/lib:/lib64:/bin:/sbin:/etc:/opt:/run:/sys",
+    ).split(":")
+    if p
+]
+
+# --- cgroup v2 aggregate memory / pid caps ---------------------------------
+# The cgroup-v2 leaf per kernel is the PRIMARY memory cap: it bounds real
+# aggregate RSS over the whole {bwrap -> kernel -> children} subtree (memory.max)
+# plus a pids cap against fork bombs (pids.max). Requires a writable cgroup-v2
+# root (we run as root on jd). RLIMIT_AS (in _preexec) is only a FALLBACK, used
+# when the cgroup cap isn't in effect (disabled, or leaf creation/join failed);
+# it is never stacked on the cgroup, because AS counts virtual address space and
+# over-counts mmap-heavy code (importing torch alone reserves tens of GB of VA),
+# which would false-positive into MemoryError below the real RSS limit.
+_CGROUP_ENABLE = os.getenv("VERL_SANDBOX_CGROUP_ENABLE", "1") != "0"
+_CGROUP_ROOT = os.getenv("VERL_SANDBOX_CGROUP_ROOT", "/sys/fs/cgroup/verl_sandbox")
+_CGROUP_PIDS_MAX = os.getenv("VERL_SANDBOX_CGROUP_PIDS_MAX", "256")
+_CGROUP_BASE_READY = False
+_CGROUP_BASE_LOCK = threading.Lock()
 
 _KERNEL_START_LOCK = threading.Lock()
 
@@ -319,6 +395,37 @@ def strip_ansi(text: str) -> str:
     return ansi_escape.sub('', text)
 
 
+def _find_child_pid(ppid: int) -> int | None:
+    """Return the single child PID of `ppid`, or None. Used to locate the kernel
+    when it runs under bwrap (bwrap is the immediate child / process-group
+    leader; the kernel is bwrap's child). Tries the cheap children file, then
+    falls back to scanning /proc."""
+    try:
+        with open(f"/proc/{ppid}/task/{ppid}/children") as f:
+            kids = f.read().split()
+        if kids:
+            return int(kids[0])
+    except (OSError, ValueError):
+        pass
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    for e in entries:
+        if not e.isdigit():
+            continue
+        try:
+            with open(f"/proc/{e}/stat") as f:
+                data = f.read()
+            # Fields after the (possibly space/paren-containing) comm: state ppid
+            after = data[data.rfind(")") + 2:].split()
+            if int(after[1]) == ppid:
+                return int(e)
+        except (OSError, IndexError, ValueError):
+            continue
+    return None
+
+
 def _force_kill_pid(pid: int):
     """Best-effort kill a process group, then the PID itself."""
     for sig in (signal.SIGKILL,):
@@ -345,6 +452,10 @@ def kill_all_kernels():
             os.waitpid(pid, os.WNOHANG)
         except (ChildProcessError, OSError):
             pass
+    # Reclaim cgroup leaves whose kernels just died (incl. cancelled rollouts
+    # whose StatefulSandbox.cleanup() never ran). Done after the reap so the
+    # leaves are empty and removable.
+    _sweep_cgroup_leaves()
 
 
 # -- Landlock isolation --------------------------------------------------------
@@ -522,6 +633,135 @@ def _apply_landlock(writable_dirs: list[str]) -> bool:
 
 # -- Sandbox class -------------------------------------------------------------
 
+def _ensure_cgroup_base() -> bool:
+    """Create the parent cgroup once and enable the memory+pids controllers in
+    its subtree so per-kernel leaves can set memory.max / pids.max. Best effort;
+    returns True if the base looks usable. Safe to call concurrently."""
+    global _CGROUP_BASE_READY
+    if _CGROUP_BASE_READY:
+        return True
+    with _CGROUP_BASE_LOCK:
+        if _CGROUP_BASE_READY:
+            return True
+        try:
+            os.makedirs(_CGROUP_ROOT, exist_ok=True)
+            # Delegate memory+pids to children. May already be on, or the real
+            # root may not have delegated them -- in that case the leaf write
+            # below fails and we fall back to RLIMIT_AS only.
+            try:
+                with open(os.path.join(_CGROUP_ROOT, "cgroup.subtree_control"), "w") as f:
+                    f.write("+memory +pids")
+            except OSError:
+                pass
+            _CGROUP_BASE_READY = True
+            return True
+        except OSError as e:
+            _log_once(
+                "cgroup_base_unusable",
+                logging.WARNING,
+                f"[sandbox] cgroup base {_CGROUP_ROOT} unusable ({e}); "
+                f"falling back to RLIMIT_AS only (logged once).",
+            )
+            return False
+
+
+def _create_cgroup(name: str, mem_max: int, pids_max: str) -> str | None:
+    """Create a per-kernel cgroup-v2 leaf with the given memory / pids caps.
+    Returns the leaf path, or None on any failure (caller keeps RLIMIT_AS)."""
+    if not _ensure_cgroup_base():
+        return None
+    leaf = os.path.join(_CGROUP_ROOT, name)
+    try:
+        os.makedirs(leaf, exist_ok=True)
+        if mem_max and mem_max > 0:
+            with open(os.path.join(leaf, "memory.max"), "w") as f:
+                f.write(str(mem_max))
+            # Forbid swap so memory.max is a hard ceiling, not soft.
+            try:
+                with open(os.path.join(leaf, "memory.swap.max"), "w") as f:
+                    f.write("0")
+            except OSError:
+                pass
+        if pids_max:
+            try:
+                with open(os.path.join(leaf, "pids.max"), "w") as f:
+                    f.write(str(pids_max))
+            except OSError:
+                pass
+        return leaf
+    except OSError as e:
+        _log_once(
+            "cgroup_create_failed",
+            logging.WARNING,
+            f"[sandbox] could not create cgroup leaf ({e}); "
+            f"falling back to RLIMIT_AS only (logged once).",
+        )
+        try:
+            os.rmdir(leaf)
+        except OSError:
+            pass
+        return None
+
+
+def _sweep_cgroup_leaves() -> None:
+    """Best-effort rmdir of empty cgroup leaves under _CGROUP_ROOT. A leaf is
+    only removable once empty (all its procs are gone), so this reclaims the
+    dirs of kernels that died without their StatefulSandbox.cleanup() running
+    (e.g. a cancelled rollout). Leaves still holding live procs fail rmdir and
+    are skipped."""
+    if not _CGROUP_ENABLE:
+        return
+    try:
+        names = os.listdir(_CGROUP_ROOT)
+    except OSError:
+        return
+    for name in names:
+        leaf = os.path.join(_CGROUP_ROOT, name)
+        try:
+            os.rmdir(leaf)  # fails (and is skipped) if non-empty or not a dir
+        except OSError:
+            pass
+
+
+def _build_bwrap_argv(
+    workspace: str,
+    read_paths_extra: "list[str] | tuple" = (),
+    write_paths_extra: "list[str] | tuple" = (),
+) -> list[str]:
+    """bwrap args implementing default-deny reads (see _BWRAP_READ_PATHS).
+
+    Read-only: the system allowlist + each path in read_paths_extra (e.g. the
+    rollout's env_dir, so the PTC kernel can import env.py / open data.db).
+    Writable: workspace + each path in write_paths_extra (e.g. the kernel's
+    connection-file tmpdir) + a private /tmp & /dev/shm. /tmp is a fresh tmpfs
+    so sibling rollouts' env_dirs are hidden; the caller's own paths are bound
+    back AFTER it. workspace is bound after the read-only extras so it overlays
+    read-write even when it sits inside one (workspace == env_dir/workspace). No
+    --unshare-* so the process keeps loopback (kernel ZMQ) and stays in our
+    process group (killpg)."""
+    argv = [_BWRAP_BIN]
+    for p in _BWRAP_READ_PATHS:
+        argv += ["--ro-bind-try", p, p]
+    argv += [
+        "--proc", "/proc",                # fresh /proc for the namespace
+        "--dev", "/dev",                  # minimal writable device nodes
+        "--tmpfs", "/tmp",                # private writable /tmp (hides siblings)
+        "--tmpfs", "/dev/shm",            # private writable shm
+    ]
+    for p in read_paths_extra:            # e.g. env_dir: env.py / data.db, read-only
+        argv += ["--ro-bind-try", p, p]
+    argv += ["--bind", workspace, workspace]   # workspace: writable (overlays env_dir)
+    for p in write_paths_extra:           # e.g. kernel.json dir: writable
+        argv += ["--bind", p, p]
+    argv += [
+        "--setenv", "HOME", workspace,    # libs write ~/.cache into the workspace
+        "--chdir", workspace,
+        "--die-with-parent",
+        "--",
+    ]
+    return argv
+
+
 class StatefulSandbox:
     """A stateful Python sandbox backed by an IPython kernel.
 
@@ -552,8 +792,14 @@ class StatefulSandbox:
         timeout: float = 10.0,
         mem_limit_bytes: int | None = None,
         interrupt_grace_seconds: float = 2.0,
+        extra_read_paths: list[str] | None = None,
     ):
         self.workspace_path = workspace_path
+        # Extra dirs to expose read-only under bwrap (besides the system
+        # allowlist), e.g. the rollout's env_dir so the PTC kernel can import
+        # env.py / open data.db. Leave empty for the main code-exec sandbox so
+        # agent code cannot read the task's data.db / answers.
+        self.extra_read_paths = list(extra_read_paths or [])
         self.timeout = timeout
         self.mem_limit_bytes = (
             mem_limit_bytes if mem_limit_bytes is not None else _DEFAULT_MEM_LIMIT_BYTES
@@ -561,11 +807,22 @@ class StatefulSandbox:
         self.interrupt_grace_seconds = interrupt_grace_seconds
         self._tmpdir: str | None = None
         self._proc: subprocess.Popen | None = None
+        # PID to target for SIGINT interrupts. Equals self._proc.pid normally;
+        # under bwrap it is bwrap's child (the real kernel) so an interrupt does
+        # not also hit the bwrap process-group leader (which would die on SIGINT
+        # and take the kernel down via --die-with-parent).
+        self._kernel_pid: int | None = None
         self._client = None
         self._conn_file: Path | None = None
         self._cleaned_up = False
         self._dead = False
         self._landlock_active = False
+        self._cgroup_dir: str | None = None
+        # cgroup memory.max for this kernel's subtree; defaults to the same
+        # value as the RLIMIT_AS cap. 0 disables the cgroup memory cap.
+        self.cgroup_mem_max = int(
+            os.getenv("VERL_SANDBOX_CGROUP_MEM_MAX", str(self.mem_limit_bytes or 0))
+        )
 
     def start(self):
         """Start the IPython kernel and initialize workspace state."""
@@ -598,21 +855,54 @@ class StatefulSandbox:
         # workspace_path : user code output
         # self._tmpdir   : kernel connection JSON file
         # /tmp           : Python's own tempfile operations inside the kernel
+        os.makedirs(self.workspace_path, exist_ok=True)  # bwrap --bind needs it to exist
         writable = [self.workspace_path, self._tmpdir, "/tmp"]
 
         abi = _landlock_abi_version()
-        landlock_ok = abi >= 1
+        # bwrap is the primary fs-confinement layer when present; Landlock is the
+        # fallback. Don't run both (see _USE_BWRAP note): bwrap's fresh /tmp and
+        # /dev/shm tmpfs aren't in a host-built Landlock allowlist.
+        use_bwrap = _USE_BWRAP
+        landlock_ok = (abi >= 1) and not use_bwrap
         mem_limit = self.mem_limit_bytes
+
+        # Per-kernel cgroup-v2 leaf: aggregate memory + pids ceiling over the
+        # whole {bwrap -> kernel -> children} subtree. Created here; the child
+        # joins it in _preexec by writing its own pid to cgroup.procs (membership
+        # is inherited across fork/exec, so every descendant is capped too).
+        if _CGROUP_ENABLE:
+            self._cgroup_dir = _create_cgroup(
+                os.path.basename(self._tmpdir),
+                mem_max=self.cgroup_mem_max,
+                pids_max=_CGROUP_PIDS_MAX,
+            )
+        cgroup_procs = (
+            os.path.join(self._cgroup_dir, "cgroup.procs") if self._cgroup_dir else None
+        )
 
         def _preexec():
             # Die with the parent. Prevents orphan ipykernels from surviving an
             # AgentLoopWorker crash / SIGKILL / OOM-kill and slowly leaking
             # memory on the node across retries.
             _set_pdeathsig(signal.SIGKILL)
-            # Cap address space so a single misbehaving kernel cannot OOM the
-            # node. Soft+hard set to the same value; hitting it raises
-            # MemoryError inside the kernel rather than killing the host.
-            if mem_limit and mem_limit > 0:
+            # cgroup is the memory cap: join it so memory.max / pids.max cover
+            # this process and every descendant (bwrap, the kernel, anything
+            # user code spawns) by real aggregate RSS.
+            joined_cgroup = False
+            if cgroup_procs is not None:
+                try:
+                    with open(cgroup_procs, "w") as f:
+                        f.write(str(os.getpid()))
+                    joined_cgroup = True
+                except OSError:
+                    joined_cgroup = False
+            # RLIMIT_AS is ONLY a fallback for when the cgroup cap isn't in
+            # effect (disabled, or leaf creation / join failed). It is never
+            # stacked on top of the cgroup: AS counts virtual address space and
+            # over-counts mmap-heavy code (importing torch alone reserves tens of
+            # GB of VA), which would false-positive into MemoryError well below
+            # the real RSS limit.
+            if not joined_cgroup and mem_limit and mem_limit > 0:
                 try:
                     resource.setrlimit(resource.RLIMIT_AS, (mem_limit, mem_limit))
                 except (ValueError, OSError):
@@ -620,12 +910,25 @@ class StatefulSandbox:
             if landlock_ok:
                 _apply_landlock(writable)
 
+        kernel_cmd = [sys.executable, "-m", "ipykernel_launcher", "-f", str(self._conn_file)]
+        if use_bwrap:
+            # bwrap runs in the same process group (no --unshare-pid), so the
+            # existing os.killpg(proc.pid, ...) paths still reach the kernel.
+            kernel_cmd = (
+                _build_bwrap_argv(
+                    self.workspace_path,
+                    read_paths_extra=self.extra_read_paths,
+                    write_paths_extra=[self._tmpdir],
+                )
+                + kernel_cmd
+            )
+
         # Fork on the dedicated lifetime thread (see _FORK_EXECUTOR) so the
         # kernel's PR_SET_PDEATHSIG is bound to a thread that lives as long as
         # the worker process, not a recyclable run_in_executor() pool thread.
         self._proc = _FORK_EXECUTOR.submit(
             subprocess.Popen,
-            [sys.executable, "-m", "ipykernel_launcher", "-f", str(self._conn_file)],
+            kernel_cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -670,6 +973,15 @@ class StatefulSandbox:
 
         self._client = client
         self._landlock_active = landlock_ok
+
+        # Resolve the kernel PID for interrupts. Under bwrap the kernel is
+        # bwrap's child; fall back to bwrap's own pid if it can't be found (then
+        # interrupts degrade to the killpg path, same as no-bwrap).
+        self._kernel_pid = self._proc.pid
+        if use_bwrap:
+            child = _find_child_pid(self._proc.pid)
+            if child is not None:
+                self._kernel_pid = child
 
         if landlock_ok:
             # Landlock is active at the OS level; install a lightweight Python
@@ -727,10 +1039,30 @@ class StatefulSandbox:
                 pass
             raise RuntimeError("Sandbox cleanup() ran concurrently with start(); kernel reaped")
 
-        if landlock_ok:
-            print(f"[sandbox] Landlock ABI v{abi} active -- writes restricted to workspace.")
+        # The confinement mode is identical for every sandbox in this worker, so
+        # log it ONCE per process (keyed by mode) instead of on every start.
+        cg = " + cgroup memory/pids cap" if self._cgroup_dir else ""
+        if use_bwrap:
+            _log_once(
+                "confine:bwrap",
+                logging.INFO,
+                f"[sandbox] bwrap fs confinement active -- default-deny reads "
+                f"(system allowlist + own paths), writes restricted to workspace{cg}.",
+            )
+        elif landlock_ok:
+            _log_once(
+                "confine:landlock",
+                logging.INFO,
+                f"[sandbox] Landlock ABI v{abi} active -- writes restricted to workspace{cg}.",
+            )
         else:
-            print("[sandbox] WARNING: Landlock unavailable -- Python open() guard only.")
+            _log_once(
+                "confine:none",
+                logging.WARNING,
+                f"[sandbox] neither bwrap nor Landlock active -- Python open() guard "
+                f"only (weak isolation){cg}. Check bwrap is on PATH / "
+                f"VERL_SANDBOX_USE_BWRAP, and kernel Landlock support.",
+            )
 
     def _try_interrupt_to_idle(self, msg_id: str, grace_seconds: float) -> bool:
         """Send SIGINT to the kernel and wait up to grace_seconds for the
@@ -740,7 +1072,14 @@ class StatefulSandbox:
         if self._proc is None or self._proc.poll() is not None:
             return False
         try:
-            os.killpg(self._proc.pid, signal.SIGINT)
+            if self._kernel_pid is not None and self._kernel_pid != self._proc.pid:
+                # Under bwrap: SIGINT only the kernel, NOT the process group --
+                # the group leader is bwrap, which would die on SIGINT and take
+                # the kernel with it (--die-with-parent), turning a state-
+                # preserving interrupt into a hard kill.
+                os.kill(self._kernel_pid, signal.SIGINT)
+            else:
+                os.killpg(self._proc.pid, signal.SIGINT)
         except (ProcessLookupError, PermissionError, OSError):
             return False
         deadline = time.time() + grace_seconds
@@ -957,6 +1296,20 @@ class StatefulSandbox:
         self._tmpdir = None
         if tmpdir is not None:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+        # rmdir the cgroup leaf -- only succeeds once empty (all procs reaped).
+        # Retry briefly in case the kernel hasn't fully exited yet.
+        cgroup_dir = self._cgroup_dir
+        self._cgroup_dir = None
+        if cgroup_dir is not None:
+            for _ in range(20):
+                try:
+                    os.rmdir(cgroup_dir)
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError:
+                    time.sleep(0.05)
 
     def __enter__(self):
         self.start()

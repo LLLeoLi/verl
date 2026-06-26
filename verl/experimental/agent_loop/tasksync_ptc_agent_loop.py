@@ -348,7 +348,14 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
             # See tasksync_agent_loop.run() for the rationale behind gating +
             # executor offload on the sandbox bring-up phase.
             async with sandbox_startup_gate():
-                ptc_sandbox = StatefulSandbox(workspace_path=env.workspace, timeout=10.0)
+                # setup_code imports env.py and opens data.db (both under
+                # env_dir), so env_dir must be readable inside the bwrap mount
+                # namespace.
+                ptc_sandbox = StatefulSandbox(
+                    workspace_path=env.workspace,
+                    timeout=10.0,
+                    extra_read_paths=[env.env_dir],
+                )
                 try:
                     await self.loop.run_in_executor(None, ptc_sandbox.start)
                 except Exception as e:
@@ -989,6 +996,17 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
             "env_tool_count": 0,
         }
         output.extra_fields["messages"] = agent_data.messages
+
+        logger.info(
+            "[rollout] task=%s reward=%.4f (raw=%.4f) success=%s turns=%d len=%d%s",
+            getattr(agent_data.env, "task_name", "?"),
+            penalized_reward,
+            float(agent_data.final_reward),
+            agent_data.success,
+            agent_data.assistant_turns,
+            rollout_length,
+            " [truncated]" if is_truncated else "",
+        )
 
         return output
 
