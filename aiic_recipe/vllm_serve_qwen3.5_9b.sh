@@ -16,7 +16,7 @@ export PATH="${CUDA_HOME}/bin:${PATH}"
 # fail with "OSError: [Errno 122] Disk quota exceeded". Redirect them all onto
 # the roomy ssddata volume: flashinfer JIT, triton JIT, torch inductor, and
 # vLLM's torch.compile cache.
-export CACHE_ROOT="/ssddata/lihao/.cache"
+export CACHE_ROOT="/mnt/public_02/lihao/.cache"
 export FLASHINFER_WORKSPACE_BASE="${CACHE_ROOT}/flashinfer"
 export TRITON_CACHE_DIR="${CACHE_ROOT}/triton"
 export TORCHINDUCTOR_CACHE_DIR="${CACHE_ROOT}/torchinductor"
@@ -24,7 +24,7 @@ export VLLM_CACHE_ROOT="${CACHE_ROOT}/vllm"
 export XDG_CACHE_HOME="${CACHE_ROOT}"
 mkdir -p "${FLASHINFER_WORKSPACE_BASE}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${VLLM_CACHE_ROOT}"
 
-MODEL_PATH="/ssddata/lihao/projects/models/Qwen3.5-9B"
+MODEL_PATH="/mnt/public_02/models/qwen3.5-9b"
 PORT=18025
 TP=1
 DP=4

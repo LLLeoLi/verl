@@ -77,7 +77,7 @@ done
 # ==============================================================================
 # Model / data paths
 # ==============================================================================
-model_path=${model_path:-/opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct}
+model_path=${model_path:-/mnt/public_02/lihao/ptc-checkpoints/Qwen3-Coder-30B-A3B-ptc-SFT}
 use_dist_checkpointing=${use_dist_checkpointing:-False}
 dist_ckpt_path=${dist_ckpt_path:-null}
 data_dir=${data_dir:-task-sync/claude-sync-v4/opus}
@@ -182,7 +182,7 @@ if [ -n "${suffix}" ]; then
     suffix_str="-${suffix}"
 fi
 exp_name=${exp_name:-"${DATE}-tasksync-30b-a3b-1stepoff-${loss_mode}-tp${actor_tp}-pp${actor_pp}-cp${actor_cp}-ep${actor_ep}-etp${actor_etp}-bsz${ppo_micro_bsz_per_gpu}-total_epochs${total_epochs}-group_size${env_group_size}-reward_type${reward_type}${dense_epoch_suffix}${suffix_str}"}
-ckpt_root=${ckpt_root:-"/mnt/bn/tiktok-mm-5/aiic/users/lihao.612/gem_checkpoints/${exp_name}"}
+ckpt_root=${ckpt_root:-"/mnt/public_02/lihao/ptc-checkpoints/${exp_name}"}
 
 echo "${exp_name}"
 echo "Resource split: actor=${actor_nnodes}x${actor_ngpus_per_node} rollout=${rollout_nnodes}x${rollout_ngpus_per_node}"
