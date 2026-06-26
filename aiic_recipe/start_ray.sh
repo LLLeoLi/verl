@@ -34,13 +34,15 @@ export RAY_record_ref_creation_sites=1
 # export CUDA_LAUNCH_BLOCKING=1
 
 # Environment variables setup (defaults if not provided)
-NNODES=${NNODES:-1}
-NODE_RANK=${NODE_RANK:-0}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
-MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-MASTER_PORT=${MASTER_PORT:-6379}
-RAY_TIMEOUT=${RAY_TIMEOUT:-1000}
-VLLM_USE_V1=${VLLM_USE_V1:-1}
+# NOTE: export these so the train script (run as a child `bash`) inherits them;
+# trainer.n_gpus_per_node / trainer.nnodes read NGPUS_PER_NODE / NNODES.
+export NNODES=${NNODES:-1}
+export NODE_RANK=${NODE_RANK:-0}
+export NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+export MASTER_PORT=${MASTER_PORT:-6379}
+export RAY_TIMEOUT=${RAY_TIMEOUT:-1000}
+export VLLM_USE_V1=${VLLM_USE_V1:-1}
 
 if [[ "$NNODES" -le 1 ]]; then
     # Single node execution
