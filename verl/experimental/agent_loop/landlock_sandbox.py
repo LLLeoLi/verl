@@ -121,7 +121,7 @@ def bwrap_usable() -> bool:
             return _BWRAP_USABLE
         try:
             r = subprocess.run(
-                [_BWRAP_BIN, "--ro-bind", "/", "/", "--", "true"],
+                [_BWRAP_BIN, "--unshare-user-try", "--ro-bind", "/", "/", "--", "true"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 timeout=10,
@@ -786,7 +786,12 @@ def _build_bwrap_argv(
     read-write even when it sits inside one (workspace == env_dir/workspace). No
     --unshare-* so the process keeps loopback (kernel ZMQ) and stays in our
     process group (killpg)."""
-    argv = [_BWRAP_BIN]
+    # --unshare-user-try: when running as root WITHOUT CAP_SYS_ADMIN (the jd k8s
+    # container), bwrap won't create a user namespace by default and the mount
+    # namespace then fails with "Operation not permitted". Forcing a user
+    # namespace first grants the caps needed for the mount ns. No-op where bwrap
+    # already unshares userns (e.g. unprivileged callers).
+    argv = [_BWRAP_BIN, "--unshare-user-try"]
     for p in _BWRAP_READ_PATHS:
         argv += ["--ro-bind-try", p, p]
     argv += [
