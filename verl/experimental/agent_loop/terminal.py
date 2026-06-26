@@ -9,9 +9,9 @@ import subprocess
 from verl.experimental.agent_loop.landlock_sandbox import (
     _CGROUP_ENABLE,
     _CGROUP_PIDS_MAX,
-    _USE_BWRAP,
     _build_bwrap_argv,
     _create_cgroup,
+    bwrap_usable,
 )
 
 # Default per-command memory cap (bytes). Seeds the cgroup memory.max (the
@@ -89,7 +89,7 @@ class TerminalExecutor:
         # is exposed (unlike the PTC sandbox), so `cat ../data.db` cannot reach
         # the answers. Falls back to a bare bash when bwrap is unavailable.
         argv = ["/bin/bash", "-c", command_string]
-        if _USE_BWRAP:
+        if bwrap_usable():
             argv = _build_bwrap_argv(self.workspace) + argv
 
         # Use Popen + start_new_session so we can kill the *entire process

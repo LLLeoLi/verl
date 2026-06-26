@@ -97,6 +97,59 @@ _BWRAP_READ_PATHS = [
     if p
 ]
 
+# Whether bwrap can actually CREATE namespaces here. Many locked-down containers
+# (k8s default seccomp / no CAP_SYS_ADMIN / unprivileged-userns disabled) reject
+# it with "Creating new namespace failed: Operation not permitted". We probe
+# once and cache; on failure callers fall back to Landlock.
+_BWRAP_USABLE: "bool | None" = None
+_BWRAP_PROBE_LOCK = threading.Lock()
+
+
+def bwrap_usable() -> bool:
+    """True iff bwrap is enabled and a trivial sandbox actually starts here.
+
+    Probed once with `bwrap --ro-bind / / -- true` and cached process-wide.
+    Used by both the kernel sandbox and the terminal executor so they agree on
+    whether to wrap commands in bwrap."""
+    global _BWRAP_USABLE
+    if not _USE_BWRAP:
+        return False
+    if _BWRAP_USABLE is not None:
+        return _BWRAP_USABLE
+    with _BWRAP_PROBE_LOCK:
+        if _BWRAP_USABLE is not None:
+            return _BWRAP_USABLE
+        try:
+            r = subprocess.run(
+                [_BWRAP_BIN, "--ro-bind", "/", "/", "--", "true"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            ok = r.returncode == 0
+            if not ok:
+                _log_once(
+                    "bwrap_unusable",
+                    logging.WARNING,
+                    f"[sandbox] bwrap is present but cannot create namespaces here "
+                    f"({r.stderr.decode(errors='replace').strip() or 'unknown error'}); "
+                    f"falling back to Landlock. NOTE: Landlock confines WRITES but not "
+                    f"READS, so read-isolation (hiding data.db / model weights / sibling "
+                    f"rollouts) is OFF. Enable userns / CAP_SYS_ADMIN in the pod "
+                    f"securityContext to use bwrap, or set VERL_SANDBOX_USE_BWRAP=0 to "
+                    f"silence this.",
+                )
+        except (OSError, subprocess.SubprocessError) as e:
+            _log_once(
+                "bwrap_probe_error",
+                logging.WARNING,
+                f"[sandbox] bwrap probe failed ({e}); falling back to Landlock.",
+            )
+            ok = False
+        _BWRAP_USABLE = ok
+        return ok
+
+
 # --- cgroup v2 aggregate memory / pid caps ---------------------------------
 # The cgroup-v2 leaf per kernel is the PRIMARY memory cap: it bounds real
 # aggregate RSS over the whole {bwrap -> kernel -> children} subtree (memory.max)
@@ -856,7 +909,7 @@ class StatefulSandbox:
         # bwrap is the primary fs-confinement layer when present; Landlock is the
         # fallback. Don't run both (see _USE_BWRAP note): bwrap's fresh /tmp and
         # /dev/shm tmpfs aren't in a host-built Landlock allowlist.
-        use_bwrap = _USE_BWRAP
+        use_bwrap = bwrap_usable()
         landlock_ok = (abi >= 1) and not use_bwrap
         mem_limit = self.mem_limit_bytes
 
