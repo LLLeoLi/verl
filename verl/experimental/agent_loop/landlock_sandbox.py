@@ -917,19 +917,38 @@ class StatefulSandbox:
                 + kernel_cmd
             )
 
+        # Capture the kernel's (and bwrap's own) stderr to a host file so an
+        # early exit reports the REAL cause (e.g. "bwrap: Creating new namespace
+        # failed", a missing-mount error, or a Python traceback) instead of an
+        # opaque exit code. The fd is inherited across exec + bwrap (bwrap keeps
+        # stdio 0/1/2), so bwrap setup errors land here too.
+        stderr_path = os.path.join(self._tmpdir, "kernel_stderr.log")
+        stderr_f = open(stderr_path, "wb")
+
+        def _stderr_tail(limit: int = 4000) -> str:
+            try:
+                with open(stderr_path, "r", errors="replace") as f:
+                    txt = f.read().strip()
+            except OSError:
+                return ""
+            return txt[-limit:] if txt else ""
+
         # Fork on the dedicated lifetime thread (see _FORK_EXECUTOR) so the
         # kernel's PR_SET_PDEATHSIG is bound to a thread that lives as long as
         # the worker process, not a recyclable run_in_executor() pool thread.
-        self._proc = _FORK_EXECUTOR.submit(
-            subprocess.Popen,
-            kernel_cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=self.workspace_path,
-            start_new_session=True,
-            preexec_fn=_preexec,
-        ).result()
+        try:
+            self._proc = _FORK_EXECUTOR.submit(
+                subprocess.Popen,
+                kernel_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_f,
+                cwd=self.workspace_path,
+                start_new_session=True,
+                preexec_fn=_preexec,
+            ).result()
+        finally:
+            stderr_f.close()  # parent's copy; the child keeps its own dup
 
         with _PID_LOCK:
             _SPAWNED_PIDS.add(self._proc.pid)
@@ -939,12 +958,18 @@ class StatefulSandbox:
             if self._conn_file.exists():
                 break
             if self._proc.poll() is not None:
+                tail = _stderr_tail()
+                mode = "bwrap" if use_bwrap else ("landlock" if landlock_ok else "guard-only")
                 raise RuntimeError(
-                    f"IPython kernel exited early with code {self._proc.returncode}"
+                    f"IPython kernel exited early with code {self._proc.returncode} "
+                    f"(confinement={mode}). stderr:\n{tail or '<empty>'}"
                 )
             time.sleep(0.05)
         else:
-            raise RuntimeError("Timeout waiting for IPython kernel to start")
+            raise RuntimeError(
+                f"Timeout waiting for IPython kernel to start. stderr:\n"
+                f"{_stderr_tail() or '<empty>'}"
+            )
 
         client = BlockingKernelClient(connection_file=str(self._conn_file))
         client.load_connection_file()
