@@ -73,7 +73,7 @@ done
 # ==============================================================================
 # Model / data paths
 # ==============================================================================
-model_path=${model_path:-/opt/tiger/entry/Qwen3-Coder-30B-A3B-Instruct}
+model_path=${model_path:-/mnt/public_02/lihao/ptc-checkpoints/Qwen3-Coder-30B-A3B-ptc-SFT}
 # Loader mode:
 #   use_dist_checkpointing=False (default) -> mbridge loads weights directly from
 #     model_path (HF format) at startup; no offline mcore conversion needed.
@@ -164,7 +164,7 @@ if [ -n "${suffix}" ]; then
     suffix_str="-${suffix}"
 fi
 exp_name=${exp_name:-"${DATE}-${loss_mode}-tp${actor_tp}-pp${actor_pp}-cp${actor_cp}-ep${actor_ep}-etp${actor_etp}-bsz${ppo_micro_bsz_per_gpu}-total_epochs${total_epochs}-group_size${env_group_size}-reward_type${reward_type}${dense_epoch_suffix}${suffix_str}"}
-ckpt_root=${ckpt_root:-"/mnt/hdfs/tiktok_aiic/user/lihao.612/tasksync_ckpts/${exp_name}"}
+ckpt_root=${ckpt_root:-"/mnt/public_02/lihao/ptc-checkpoints/${exp_name}"}
 
 echo "${exp_name}"
 

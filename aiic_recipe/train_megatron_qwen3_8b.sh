@@ -15,7 +15,11 @@
 # ==============================================================================
 set -x
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# NOTE: do NOT set expandable_segments:True here. vLLM 0.20.0's CuMemAllocator
+# (used because free_cache_engine=True for KV-cache sleep/wake) hard-asserts that
+# PYTORCH_CUDA_ALLOC_CONF must not contain "expandable_segments:True", and the
+# vLLM worker subprocesses inherit this env var -> WorkerProc init crashes.
+# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -74,7 +78,7 @@ done
 # ==============================================================================
 # Model / data paths
 # ==============================================================================
-model_path=${model_path:-/opt/tiger/entry/Qwen3-8B}
+model_path=${model_path:-/mnt/public_02/lihao/ptc-checkpoints/Qwen-3-8B-ptc-SFT}
 use_dist_checkpointing=${use_dist_checkpointing:-False}
 dist_ckpt_path=${dist_ckpt_path:-null}
 data_dir=${data_dir:-task-sync/claude-sync-v4/opus}
@@ -155,7 +159,7 @@ if [ -n "${suffix}" ]; then
     suffix_str="-${suffix}"
 fi
 exp_name=${exp_name:-"${DATE}-qwen3_8b-${loss_mode}-tp${actor_tp}-pp${actor_pp}-cp${actor_cp}-bsz${ppo_micro_bsz_per_gpu}-total_epochs${total_epochs}-group_size${env_group_size}-reward_type${reward_type}${dense_epoch_suffix}${suffix_str}"}
-ckpt_root=${ckpt_root:-"/mnt/hdfs/tiktok_aiic/user/lihao.612/tasksync_ckpts/${exp_name}"}
+ckpt_root=${ckpt_root:-"/mnt/public_02/lihao/ptc-checkpoints/${exp_name}"}
 
 echo "${exp_name}"
 

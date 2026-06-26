@@ -71,7 +71,7 @@ done
 # ==============================================================================
 # Model / data paths
 # ==============================================================================
-model_path=${model_path:-/opt/tiger/entry/Qwen3.5-9B}
+model_path=${model_path:-/mnt/public_02/lihao/ptc-checkpoints/Qwen3.5-9B-ptc-SFT}
 use_dist_checkpointing=${use_dist_checkpointing:-False}
 dist_ckpt_path=${dist_ckpt_path:-null}
 data_dir=${data_dir:-task-sync/claude-sync-v4/opus}
@@ -150,7 +150,7 @@ if [ -n "${suffix}" ]; then
     suffix_str="-${suffix}"
 fi
 exp_name=${exp_name:-"${DATE}-qwen3_5_9b-${loss_mode}-tp${actor_tp}-pp${actor_pp}-cp${actor_cp}-bsz${ppo_micro_bsz_per_gpu}-total_epochs${total_epochs}-group_size${env_group_size}-reward_type${reward_type}${dense_epoch_suffix}${suffix_str}"}
-ckpt_root=${ckpt_root:-"/mnt/hdfs/tiktok_aiic/user/lihao.612/tasksync_ckpts/${exp_name}"}
+ckpt_root=${ckpt_root:-"/mnt/public_02/lihao/ptc-checkpoints/${exp_name}"}
 
 echo "${exp_name}"
 
