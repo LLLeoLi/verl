@@ -14,12 +14,7 @@
 #       [--exp_name ...] [--model_path ...] [...]
 # ==============================================================================
 set -x
-
-# NOTE: do NOT set expandable_segments:True here. vLLM 0.20.0's CuMemAllocator
-# (used because free_cache_engine=True for KV-cache sleep/wake) hard-asserts that
-# PYTORCH_CUDA_ALLOC_CONF must not contain "expandable_segments:True", and the
-# vLLM worker subprocesses inherit this env var -> WorkerProc init crashes.
-# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export VERL_LOGGING_LEVEL=INFO
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
