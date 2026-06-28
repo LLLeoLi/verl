@@ -1195,15 +1195,20 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         }
         output.extra_fields["messages"] = agent_data.messages
 
-        logger.info(
-            "[rollout] task=%s reward=%.4f (raw=%.4f) success=%s turns=%d len=%d%s",
-            getattr(agent_data.env, "task_name", "?"),
-            penalized_reward,
-            float(agent_data.final_reward),
-            agent_data.success,
-            agent_data.assistant_turns,
-            rollout_length,
-            " [truncated]" if is_truncated else "",
+        # Emitted via print (not logger.info) so it always reaches the driver
+        # console: Ray forwards worker stdout regardless of the logger's effective
+        # level, which inside the rollout worker is raised above INFO.
+        print(
+            "[rollout] task={} reward={:.4f} (raw={:.4f}) success={} turns={} len={}{}".format(
+                getattr(agent_data.env, "task_name", "?"),
+                penalized_reward,
+                float(agent_data.final_reward),
+                agent_data.success,
+                agent_data.assistant_turns,
+                rollout_length,
+                " [truncated]" if is_truncated else "",
+            ),
+            flush=True,
         )
 
         return output
