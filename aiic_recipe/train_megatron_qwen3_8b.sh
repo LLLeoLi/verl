@@ -14,7 +14,6 @@
 #       [--exp_name ...] [--model_path ...] [...]
 # ==============================================================================
 set -x
-export VERL_LOGGING_LEVEL=INFO
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
