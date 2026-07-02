@@ -132,3 +132,6 @@ outputs
 .history
 0611-gspo-step-25-game_states/*.json
 ds-ptc-*
+
+# Claude Code worktree isolation dirs (never commit these)
+.claude/worktrees/
