@@ -104,7 +104,7 @@ weight_decay=${weight_decay:-0.1}
 # Parallelism (Qwen3.5-9B dense)
 #   tp=8 cp=1 pp=1 -> 8-way model parallel; with NGPUS=16 gives DP=2.
 # ==============================================================================
-rollout_tp=${rollout_tp:-8}
+rollout_tp=${rollout_tp:-1}
 actor_tp=${actor_tp:-8}
 actor_pp=${actor_pp:-1}
 actor_cp=${actor_cp:-1}

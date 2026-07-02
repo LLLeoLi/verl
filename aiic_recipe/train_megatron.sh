@@ -109,7 +109,7 @@ weight_decay=${weight_decay:-0.1}
 # ==============================================================================
 # Parallelism
 # ==============================================================================
-rollout_tp=${rollout_tp:-8}
+rollout_tp=${rollout_tp:-2}
 actor_tp=${actor_tp:-2}
 actor_pp=${actor_pp:-2}
 actor_cp=${actor_cp:-2}
