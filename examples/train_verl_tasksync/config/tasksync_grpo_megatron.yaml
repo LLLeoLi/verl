@@ -53,6 +53,9 @@ actor_rollout_ref:
     #           "mixed" -> each task contributes both PTC and no-PTC groups
     #                     (effective batch doubles; ppo_mini_batch_size auto-doubled).
     ptc_mode: ptc
+    # ptc_desc: "rich" -> full PTC tool description with examples;
+    #           "minimal" -> one-liner (matches ptc-mini SFT data).
+    ptc_desc: rich
     # Per-error penalty subtracted from final reward (counts only
     # programmatic_tool_call failures). 0.0 disables; final reward is clipped
     # to >= 0 so the penalty can't flip a successful rollout negative.

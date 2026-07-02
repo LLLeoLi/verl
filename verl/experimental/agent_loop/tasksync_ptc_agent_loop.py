@@ -97,34 +97,63 @@ SYSTEM_PROMPT = (
 )
 
 
-PTC_TOOL_DESCRIPTION = (
-    "Execute Python in a stateful sandbox. **This is the only way to invoke env tools.** "
-    "Every env tool listed above is exposed inside the sandbox as `tools[\"<tool_name>\"]` — "
-    "call them with the same kwargs as their schema. The env tools cannot be invoked as "
-    "standalone tool calls; you must go through this sandbox.\n\n"
-    "State (variables, imports) persists across calls. `os`, `json`, `csv`, `sys` are "
-    "pre-imported. Use `print()` to surface output. File paths are relative to the workspace.\n\n"
-    "Examples:\n"
+PTC_TOOL_DESCRIPTION_MINIMAL = (
+    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. '
+    "State (variables, imports) persists across calls; use print() to see output."
+)
+
+PTC_TOOL_DESCRIPTION_RICH = (
+    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. '
+    "State (variables, imports) persists across calls; use print() to see output.\n\n"
+    "USE WHEN: loops, conditionals, error handling, or chaining multiple tool calls "
+    "with intermediate processing.\n\n"
+    "Batch processing:\n"
     "```python\n"
-    "# Single call\n"
-    "result = tools[\"query_sales\"](region=\"West\")\n"
-    "print(result)\n"
-    "```\n"
+    "results = []\n"
+    "for region in ['West', 'East', 'Central']:\n"
+    "    data = tools[\"query_sales\"](region=region)\n"
+    "    total = sum(row['revenue'] for row in data)\n"
+    "    results.append((region, total))\n"
+    "print(max(results, key=lambda x: x[1]))\n"
+    "```\n\n"
+    "Conditional workflow:\n"
     "```python\n"
-    "# Loop / batch — preferred over many single tool calls\n"
-    "totals = {}\n"
-    "for region in [\"West\", \"East\", \"Central\"]:\n"
-    "    rows = tools[\"query_sales\"](region=region)\n"
-    "    totals[region] = sum(r[\"revenue\"] for r in rows)\n"
-    "print(max(totals, key=totals.get))\n"
-    "```\n"
+    "info = tools[\"get_info\"](id='A001')\n"
+    "if info['status'] == 'active':\n"
+    "    details = tools[\"get_details\"](id='A001')\n"
+    "    print(details)\n"
+    "else:\n"
+    "    print('Inactive, skipped')\n"
+    "```\n\n"
+    "Error handling (tools may raise or return error payloads):\n"
     "```python\n"
-    "# Branching on intermediate results\n"
-    "info = tools[\"get_info\"](id=\"A001\")\n"
-    "if info[\"status\"] == \"active\":\n"
-    "    print(tools[\"get_details\"](id=\"A001\"))\n"
+    "results = []\n"
+    "for item_id in ['A001', 'A002', 'A003']:\n"
+    "    try:\n"
+    "        row = tools[\"get_info\"](id=item_id)\n"
+    "        if isinstance(row, dict) and row.get('error'):\n"
+    "            print(f'Skipping {item_id}: {row[\"error\"]}')\n"
+    "            continue\n"
+    "        results.append(row)\n"
+    "    except Exception as e:\n"
+    "        print(f'Failed {item_id}: {e}')\n"
+    "print(results)\n"
+    "```\n\n"
+    "Aggregate and filter across many calls:\n"
+    "```python\n"
+    "rows = []\n"
+    "for page in range(1, 4):\n"
+    "    batch = tools[\"list_records\"](page=page, page_size=50)\n"
+    "    rows.extend(batch)\n"
+    "filtered = [r for r in rows if r.get('score', 0) >= 80]\n"
+    "print(len(filtered), filtered[:3])\n"
     "```"
 )
+
+PTC_DESCRIPTIONS = {
+    "minimal": PTC_TOOL_DESCRIPTION_MINIMAL,
+    "rich": PTC_TOOL_DESCRIPTION_RICH,
+}
 
 
 _ENV_FILES = ["data.py", "env.py", "prompt.md"]
@@ -142,6 +171,7 @@ class TaskSyncEnvState:
     env_file: str
     task_name: str = ""
     max_tool_calls: int = 50
+    ptc_desc: str = "rich"
 
     ptc_sandbox: Optional[Any] = field(default=None, init=False)
     terminal_executor: Optional[Any] = field(default=None, init=False)
@@ -162,7 +192,7 @@ class TaskSyncEnvState:
             "type": "function",
             "function": {
                 "name": "programmatic_tool_call",
-                "description": PTC_TOOL_DESCRIPTION,
+                "description": PTC_DESCRIPTIONS[self.ptc_desc],
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -285,6 +315,11 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
         self.ptc_timeout = env_cfg.get("ptc_timeout", 5.0)
         self.data_py_timeout = env_cfg.get("data_py_timeout", 120)
 
+        self.ptc_desc = env_cfg.get("ptc_desc", "rich")
+        assert self.ptc_desc in PTC_DESCRIPTIONS, (
+            f"ptc_desc must be one of {list(PTC_DESCRIPTIONS)}, got '{self.ptc_desc}'"
+        )
+
         self.reward_type = env_cfg.get("reward_type", "dense")
         assert self.reward_type in ("dense", "binary"), (
             f"reward_type must be 'dense' or 'binary', got '{self.reward_type}'"
@@ -320,9 +355,11 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
         if isinstance(raw_prompt, dict) and "task_info" in raw_prompt:
             task_info = raw_prompt["task_info"]
             max_tool_calls = raw_prompt.get("max_tool_calls", self.max_tool_calls)
+            ptc_desc = raw_prompt.get("ptc_desc", self.ptc_desc)
         elif "task_info" in extra_info:
             task_info = extra_info["task_info"]
             max_tool_calls = extra_info.get("max_tool_calls", self.max_tool_calls)
+            ptc_desc = extra_info.get("ptc_desc", self.ptc_desc)
         else:
             raise ValueError("task_info not found in raw_prompt or extra_info")
 
@@ -337,7 +374,7 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
         await acquire_rollout_slot()
         try:
             try:
-                env = await self._create_env_from_task_info(task_info)
+                env = await self._create_env_from_task_info(task_info, ptc_desc=ptc_desc)
             except Exception as e:
                 logger.error(f"Failed to create env for task {task_info.get('task_name', '?')}: {e}")
                 metrics["env_creation_error"] = str(e)
@@ -496,7 +533,7 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
             raise
         return env_dir
 
-    async def _create_env_from_task_info(self, task_info: dict[str, Any]) -> TaskSyncEnvState:
+    async def _create_env_from_task_info(self, task_info: dict[str, Any], ptc_desc: str = "rich") -> TaskSyncEnvState:
         source_path = task_info["source_path"]
         task_name = task_info.get("task_name", os.path.basename(source_path))
 
@@ -547,6 +584,7 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
             env_file=env_file,
             task_name=task_name,
             max_tool_calls=self.max_tool_calls,
+            ptc_desc=ptc_desc,
         )
 
     def _setup_ptc_sandbox_tools(self, sandbox: StatefulSandbox, env: TaskSyncEnvState) -> dict:

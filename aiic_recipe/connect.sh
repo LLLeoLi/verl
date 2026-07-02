@@ -36,6 +36,10 @@ fi
 echo "📝 正在写入 SSH config..."
 
 cat > "$CONFIG_PATH" <<'EOF'
+Host *
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+
 Host Proxy-RAS
   HostName ras.cse.ust.hk
   User lihao
@@ -65,15 +69,20 @@ echo ""
 read -p "✅ 公钥添加完成后，按 Enter 键继续配置端口转发..." _
 
 echo ""
-read -p "请输入远程端口号 (默认 17029): " REMOTE_PORT
-REMOTE_PORT=${REMOTE_PORT:-17029}
+read -p "请输入远程端口号 (默认 18025): " REMOTE_PORT
+REMOTE_PORT=${REMOTE_PORT:-18025}
 
-read -p "请输入本地端口号 (默认 7029): " LOCAL_PORT
-LOCAL_PORT=${LOCAL_PORT:-7029}
+read -p "请输入本地端口号 (默认 8025): " LOCAL_PORT
+LOCAL_PORT=${LOCAL_PORT:-8025}
 
 echo ""
 echo "🔗 正在建立反向端口转发 (远程 $REMOTE_PORT -> 本地 $LOCAL_PORT)..."
-echo "   命令: ssh -v -N -R $REMOTE_PORT:127.0.0.1:$LOCAL_PORT HKUST-NLP"
+echo "   命令: ssh -N -R $REMOTE_PORT:127.0.0.1:$LOCAL_PORT HKUST-NLP"
 echo ""
 
-ssh -v -N -R "$REMOTE_PORT":127.0.0.1:"$LOCAL_PORT" HKUST-NLP
+ssh -v -N \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    -R "$REMOTE_PORT":127.0.0.1:"$LOCAL_PORT" \
+    HKUST-NLP

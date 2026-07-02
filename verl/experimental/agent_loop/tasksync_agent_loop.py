@@ -99,6 +99,64 @@ SYSTEM_PROMPT = (
     "When you have finished the task, call the 'claim_done' tool to submit your result."
 )
 
+PTC_TOOL_DESCRIPTION_MINIMAL = (
+    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. '
+    "State (variables, imports) persists across calls; use print() to see output."
+)
+
+PTC_TOOL_DESCRIPTION_RICH = (
+    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. '
+    "State (variables, imports) persists across calls; use print() to see output.\n\n"
+    "USE WHEN: loops, conditionals, error handling, or chaining multiple tool calls "
+    "with intermediate processing.\n\n"
+    "Batch processing:\n"
+    "```python\n"
+    "results = []\n"
+    "for region in ['West', 'East', 'Central']:\n"
+    "    data = tools[\"query_sales\"](region=region)\n"
+    "    total = sum(row['revenue'] for row in data)\n"
+    "    results.append((region, total))\n"
+    "print(max(results, key=lambda x: x[1]))\n"
+    "```\n\n"
+    "Conditional workflow:\n"
+    "```python\n"
+    "info = tools[\"get_info\"](id='A001')\n"
+    "if info['status'] == 'active':\n"
+    "    details = tools[\"get_details\"](id='A001')\n"
+    "    print(details)\n"
+    "else:\n"
+    "    print('Inactive, skipped')\n"
+    "```\n\n"
+    "Error handling (tools may raise or return error payloads):\n"
+    "```python\n"
+    "results = []\n"
+    "for item_id in ['A001', 'A002', 'A003']:\n"
+    "    try:\n"
+    "        row = tools[\"get_info\"](id=item_id)\n"
+    "        if isinstance(row, dict) and row.get('error'):\n"
+    "            print(f'Skipping {item_id}: {row[\"error\"]}')\n"
+    "            continue\n"
+    "        results.append(row)\n"
+    "    except Exception as e:\n"
+    "        print(f'Failed {item_id}: {e}')\n"
+    "print(results)\n"
+    "```\n\n"
+    "Aggregate and filter across many calls:\n"
+    "```python\n"
+    "rows = []\n"
+    "for page in range(1, 4):\n"
+    "    batch = tools[\"list_records\"](page=page, page_size=50)\n"
+    "    rows.extend(batch)\n"
+    "filtered = [r for r in rows if r.get('score', 0) >= 80]\n"
+    "print(len(filtered), filtered[:3])\n"
+    "```"
+)
+
+PTC_DESCRIPTIONS = {
+    "minimal": PTC_TOOL_DESCRIPTION_MINIMAL,
+    "rich": PTC_TOOL_DESCRIPTION_RICH,
+}
+
 
 _ENV_FILES = ["data.py", "env.py", "prompt.md"]
 
@@ -116,6 +174,7 @@ class TaskSyncEnvState:
     task_name: str = ""
     max_tool_calls: int = 50
     enable_ptc: bool = True
+    ptc_desc: str = "rich"
 
     sandbox: Optional[Any] = field(default=None, init=False)
     ptc_sandbox: Optional[Any] = field(default=None, init=False)
@@ -159,34 +218,7 @@ class TaskSyncEnvState:
                 "type": "function",
                 "function": {
                     "name": "programmatic_tool_call",
-                    "description": (
-                        "Execute Python code that can call env data tools via "
-                        "`tools[\"func_name\"](*args, **kwargs)`. "
-                        "State persists across calls. Use print() for output. "
-                        "Note: `tools[\"...\"]` only accesses env data tools listed above.\n\n"
-                        "USE WHEN: loops, conditionals, or chaining multiple tool calls with intermediate "
-                        "processing.\n"
-                        "DO NOT USE FOR: single tool calls whose results you need in full without further "
-                        "processing -- call tools directly instead.\n\n"
-                        "Batch processing:\n"
-                        "```python\n"
-                        "results = []\n"
-                        "for region in ['West', 'East', 'Central']:\n"
-                        "    data = tools[\"query_sales\"](region)\n"
-                        "    total = sum(row['revenue'] for row in data)\n"
-                        "    results.append((region, total))\n"
-                        "print(max(results, key=lambda x: x[1]))\n"
-                        "```\n\n"
-                        "Conditional workflow:\n"
-                        "```python\n"
-                        "info = tools[\"get_info\"](id='A001')\n"
-                        "if info['status'] == 'active':\n"
-                        "    details = tools[\"get_details\"](id='A001')\n"
-                        "    print(details)\n"
-                        "else:\n"
-                        "    print('Inactive, skipped')\n"
-                        "```"
-                    ),
+                    "description": PTC_DESCRIPTIONS[self.ptc_desc],
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -342,6 +374,11 @@ class TaskSyncAgentLoop(AgentLoopBase):
         )
         self.enable_ptc_default = self.ptc_mode != "no-ptc"
 
+        self.ptc_desc = env_cfg.get("ptc_desc", "rich")
+        assert self.ptc_desc in PTC_DESCRIPTIONS, (
+            f"ptc_desc must be one of {list(PTC_DESCRIPTIONS)}, got '{self.ptc_desc}'"
+        )
+
         # tool_call_format selects how the inner of <tool_call>...</tool_call>
         # (and bare top-level blobs) is parsed:
         #   "auto" -- try XML <function=...>, fall back to JSON (default)
@@ -388,10 +425,12 @@ class TaskSyncAgentLoop(AgentLoopBase):
             task_info = raw_prompt["task_info"]
             max_tool_calls = raw_prompt.get("max_tool_calls", self.max_tool_calls)
             enable_ptc = bool(raw_prompt.get("enable_ptc", self.enable_ptc_default))
+            ptc_desc = raw_prompt.get("ptc_desc", self.ptc_desc)
         elif "task_info" in extra_info:
             task_info = extra_info["task_info"]
             max_tool_calls = extra_info.get("max_tool_calls", self.max_tool_calls)
             enable_ptc = bool(extra_info.get("enable_ptc", self.enable_ptc_default))
+            ptc_desc = extra_info.get("ptc_desc", self.ptc_desc)
         else:
             raise ValueError("task_info not found in raw_prompt or extra_info")
 
@@ -408,7 +447,7 @@ class TaskSyncAgentLoop(AgentLoopBase):
         await acquire_rollout_slot()
         try:
             try:
-                env = await self._create_env_from_task_info(task_info, enable_ptc=enable_ptc)
+                env = await self._create_env_from_task_info(task_info, enable_ptc=enable_ptc, ptc_desc=ptc_desc)
             except Exception as e:
                 logger.error(f"Failed to create env for task {task_info.get('task_name', '?')}: {e}")
                 metrics["env_creation_error"] = str(e)
@@ -579,7 +618,7 @@ class TaskSyncAgentLoop(AgentLoopBase):
         return env_dir
 
     async def _create_env_from_task_info(
-        self, task_info: dict[str, Any], enable_ptc: bool
+        self, task_info: dict[str, Any], enable_ptc: bool, ptc_desc: str = "rich"
     ) -> TaskSyncEnvState:
         source_path = task_info["source_path"]
         task_name = task_info.get("task_name", os.path.basename(source_path))
@@ -636,6 +675,7 @@ class TaskSyncAgentLoop(AgentLoopBase):
             task_name=task_name,
             max_tool_calls=self.max_tool_calls,
             enable_ptc=enable_ptc,
+            ptc_desc=ptc_desc,
         )
 
     def _setup_ptc_sandbox_tools(self, sandbox: StatefulSandbox, env: TaskSyncEnvState) -> dict:

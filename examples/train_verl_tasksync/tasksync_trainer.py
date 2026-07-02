@@ -117,6 +117,7 @@ class TaskSyncTrainer(RayPPOTrainer):
         assert self.ptc_mode in ("ptc", "no-ptc", "mixed"), (
             f"ptc_mode must be 'ptc', 'no-ptc', or 'mixed', got '{self.ptc_mode}'"
         )
+        self.ptc_desc = env_cfg.get("ptc_desc", "rich")
         if self.ptc_mode == "mixed":
             old_mini = config.actor_rollout_ref.actor.ppo_mini_batch_size
             with open_dict(config):
@@ -828,6 +829,7 @@ class TaskSyncTrainer(RayPPOTrainer):
                         "task_info": task_info,
                         "max_tool_calls": max_tool_calls,
                         "enable_ptc": enable_ptc,
+                        "ptc_desc": self.ptc_desc,
                     })
                     task_uids.append(task_uid)
 
