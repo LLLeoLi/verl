@@ -104,7 +104,7 @@ weight_decay=${weight_decay:-0.1}
 #   tp=4 cp=2 pp=1 -> 8-way model parallel; with NGPUS=16 gives DP=2.
 #   cp=2 is required so max_token_len_per_gpu * cp >= total_len fits.
 # ==============================================================================
-rollout_tp=${rollout_tp:-2}
+rollout_tp=${rollout_tp:-4}
 actor_tp=${actor_tp:-4}
 actor_pp=${actor_pp:-1}
 actor_cp=${actor_cp:-2}
