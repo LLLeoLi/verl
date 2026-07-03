@@ -72,15 +72,18 @@ TOOLS_PROXY_SOURCE = textwrap.dedent(r'''
 class _ToolsProxy:
     """Proxy that allows `tools["function_name"](*args, **kwargs)` inside the programmatic tool call sandbox.
     Also supports `tools.function_name(...)` for backward compatibility."""
+    @staticmethod
+    def _unknown(name):
+        return "Unknown tool '%s'. Available tools: %s" % (name, ", ".join(sorted(env.tools)))
     def __getitem__(self, name):
         if name not in env.tools:
-            raise KeyError(name)
+            raise KeyError(self._unknown(name))
         def _call(*args, **kwargs):
             return env.tools[name](*args, **kwargs)
         return _call
     def __getattr__(self, name):
         if name not in env.tools:
-            raise AttributeError(name)
+            raise AttributeError(self._unknown(name))
         def _call(*args, **kwargs):
             return env.tools[name](*args, **kwargs)
         return _call
@@ -97,16 +100,18 @@ SYSTEM_PROMPT = (
 )
 
 
-PTC_TOOL_DESCRIPTION_MINIMAL = (
-    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. '
-    "State (variables, imports) persists across calls; use print() to see output."
-)
+PTC_TOOL_DESCRIPTION_MINIMAL = 'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. State (variables, imports) persists across calls; use print() to see output.'  # noqa: E501
 
 PTC_TOOL_DESCRIPTION_RICH = (
-    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. '
-    "State (variables, imports) persists across calls; use print() to see output.\n\n"
-    "USE WHEN: loops, conditionals, error handling, or chaining multiple tool calls "
-    "with intermediate processing.\n\n"
+    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. State (variables, imports) persists across calls; use print() to see output.\n\n'  # noqa: E501
+    "USE WHEN: loops, conditionals, error handling, or chaining multiple tool calls with intermediate processing.\n\n"
+    "Notes:\n"
+    "- Code runs in the workspace directory and file writes are restricted to it; os, json, csv, sys are pre-imported.\n"  # noqa: E501
+    "- Tools return native Python values; the type and structure vary by tool (e.g. dict, list, or str), so a quick `print(type(r), repr(r)[:200])` on one result shows the shape before processing many.\n"  # noqa: E501
+    "- Very large printed output is truncated; print summaries rather than large raw data.\n"
+    "- On an exception the traceback is returned; variables and tool side effects from lines that already ran are kept.\n"  # noqa: E501
+    "- Each call has an execution time limit; long loops can be split across calls.\n\n"
+    "Usage examples:\n\n"
     "Batch processing:\n"
     "```python\n"
     "results = []\n"
@@ -127,26 +132,13 @@ PTC_TOOL_DESCRIPTION_RICH = (
     "```\n\n"
     "Error handling (tools may raise or return error payloads):\n"
     "```python\n"
-    "results = []\n"
+    "ok, failed = [], []\n"
     "for item_id in ['A001', 'A002', 'A003']:\n"
     "    try:\n"
-    "        row = tools[\"get_info\"](id=item_id)\n"
-    "        if isinstance(row, dict) and row.get('error'):\n"
-    "            print(f'Skipping {item_id}: {row[\"error\"]}')\n"
-    "            continue\n"
-    "        results.append(row)\n"
+    "        ok.append(tools[\"get_info\"](id=item_id))\n"
     "    except Exception as e:\n"
-    "        print(f'Failed {item_id}: {e}')\n"
-    "print(results)\n"
-    "```\n\n"
-    "Aggregate and filter across many calls:\n"
-    "```python\n"
-    "rows = []\n"
-    "for page in range(1, 4):\n"
-    "    batch = tools[\"list_records\"](page=page, page_size=50)\n"
-    "    rows.extend(batch)\n"
-    "filtered = [r for r in rows if r.get('score', 0) >= 80]\n"
-    "print(len(filtered), filtered[:3])\n"
+    "        failed.append((item_id, str(e)))\n"
+    "print(f'{len(ok)} ok, {len(failed)} failed:', failed[:3])\n"
     "```"
 )
 
@@ -312,7 +304,9 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
 
         env_cfg = self.config.actor_rollout_ref.env
         self.max_tool_calls = env_cfg.get("max_tool_calls", 50)
-        self.ptc_timeout = env_cfg.get("ptc_timeout", 5.0)
+        # Per-execute() timeout of the PTC sandbox kernel. Default matches the
+        # previously hardcoded value so existing runs keep their behavior.
+        self.ptc_timeout = float(env_cfg.get("ptc_timeout", 10.0))
         self.data_py_timeout = env_cfg.get("data_py_timeout", 120)
 
         self.ptc_desc = env_cfg.get("ptc_desc", "rich")
@@ -390,7 +384,7 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
                 # namespace.
                 ptc_sandbox = StatefulSandbox(
                     workspace_path=env.workspace,
-                    timeout=10.0,
+                    timeout=self.ptc_timeout,
                     extra_read_paths=[env.env_dir],
                 )
                 try:

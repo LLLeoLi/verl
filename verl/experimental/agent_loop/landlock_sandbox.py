@@ -68,6 +68,13 @@ def _log_once(key: str, level: int, msg: str) -> None:
 # 4GiB is generous for the lightweight tasksync tool sandboxes.
 _DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_SANDBOX_MEM_LIMIT_BYTES", str(4 * 1024**3)))
 
+# Cap on the output string a single execute() call may return (chars). Rollouts
+# occasionally print entire fetched datasets (hundreds of KB), which blows past
+# the token budget and terminates the rollout; truncating keeps it alive and
+# the marker tells the model what happened. Override via the `max_output_chars`
+# kwarg or this env var. 0 disables truncation.
+_DEFAULT_MAX_OUTPUT_CHARS = int(os.getenv("VERL_SANDBOX_MAX_OUTPUT_CHARS", "50000"))
+
 # --- bubblewrap (bwrap) filesystem confinement -----------------------------
 # When bwrap is on the PATH it becomes the PRIMARY fs-confinement layer. Reads
 # are default-DENY: only an allowlist of system dirs (read-only) plus this
@@ -440,6 +447,23 @@ def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from text."""
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
+
+
+def truncate_output(text: str, limit: int) -> str:
+    """Middle-truncate `text` to ~`limit` chars, keeping head and tail.
+
+    The head usually carries the model's own progress prints and the tail the
+    final summary/traceback, so both are preserved. `limit <= 0` disables.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = int(limit * 0.7)
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return (
+        f"{text[:head]}\n...[output truncated: {omitted} chars omitted; "
+        f"print concise summaries instead of large raw data]...\n{text[-tail:]}"
+    )
 
 
 def _find_child_pid(ppid: int) -> int | None:
@@ -845,8 +869,12 @@ class StatefulSandbox:
         mem_limit_bytes: int | None = None,
         interrupt_grace_seconds: float = 2.0,
         extra_read_paths: list[str] | None = None,
+        max_output_chars: int | None = None,
     ):
         self.workspace_path = workspace_path
+        self.max_output_chars = (
+            max_output_chars if max_output_chars is not None else _DEFAULT_MAX_OUTPUT_CHARS
+        )
         # Extra dirs to expose read-only under bwrap (besides the system
         # allowlist), e.g. the rollout's env_dir so the PTC kernel can import
         # env.py / open data.db. Leave empty for the main code-exec sandbox so
@@ -1302,7 +1330,8 @@ class StatefulSandbox:
             result = output
             if error.strip():
                 result += ("\n[stderr]:\n" if result else "") + error.strip()
-            return (result.strip() if result.strip() else "(no output)"), success
+            result = truncate_output(result.strip(), self.max_output_chars)
+            return (result if result else "(no output)"), success
         except TimeoutError:
             suffix = (
                 " Sandbox killed; subsequent code will not run."
