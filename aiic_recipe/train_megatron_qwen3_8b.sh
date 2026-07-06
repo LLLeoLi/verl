@@ -75,7 +75,7 @@ done
 model_path=${model_path:-/mnt/public_02/lihao/ptc-checkpoints/Qwen-3-8B-ptc-SFT}
 use_dist_checkpointing=${use_dist_checkpointing:-False}
 dist_ckpt_path=${dist_ckpt_path:-null}
-data_dir=${data_dir:-task-sync/claude-sync-v4/opus}
+data_dir=${data_dir:-task-sync/claude-sync-qwen3-8b}
 
 # ==============================================================================
 # Sequence lengths
