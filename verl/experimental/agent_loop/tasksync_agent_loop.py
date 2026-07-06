@@ -171,6 +171,7 @@ class TaskSyncEnvState:
     sandbox: Optional[Any] = field(default=None, init=False)
     ptc_sandbox: Optional[Any] = field(default=None, init=False)
     terminal_executor: Optional[Any] = field(default=None, init=False)
+    ptc_db_path: Optional[str] = field(default=None, init=False)
 
     current_num_calls: int = field(default=0, init=False)
     is_done: bool = field(default=False, init=False)
@@ -679,6 +680,19 @@ class TaskSyncAgentLoop(AgentLoopBase):
         )
 
     def _setup_ptc_sandbox_tools(self, sandbox: StatefulSandbox, env: TaskSyncEnvState) -> dict:
+        # Copy data.db into the writable workspace so write-tools (e.g.
+        # create_allocation_decision) can INSERT into it.  env_dir is mounted
+        # read-only in the PTC bwrap namespace to prevent the agent from
+        # reading ground-truth answers, but that also blocks legitimate DB
+        # writes.  The workspace overlay is always writable.
+        ptc_db_path = os.path.join(env.workspace, ".ptc_data.db")
+        try:
+            shutil.copy2(env.db_path, ptc_db_path)
+        except OSError as e:
+            logger.warning(f"Failed to copy data.db for PTC sandbox: {e}")
+            ptc_db_path = env.db_path  # fall back to original (read-only)
+        env.ptc_db_path = ptc_db_path
+
         setup_code = textwrap.dedent(f"""\
 import sys, os, json, csv
 import importlib.util as _ilu
@@ -687,7 +701,7 @@ import importlib.util as _ilu
 _spec = _ilu.spec_from_file_location('_task_env_mod', {repr(env.env_file)})
 _mod = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
-env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)})
+env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)})
 
 {TOOLS_PROXY_SOURCE}
 
@@ -696,6 +710,46 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         if not success:
             return {"success": False, "error": result}
         return {"success": True, "output": result}
+
+    @staticmethod
+    def _merge_ptc_db_writes(env: TaskSyncEnvState) -> None:
+        """Merge tables created by PTC write-tools back into the original DB.
+
+        The PTC sandbox operates on a writable copy of data.db placed in the
+        workspace.  Write-tools (e.g. create_allocation_decision) CREATE new
+        tables there.  step() evaluates against the original data.db, so we
+        copy any tables that exist only in the PTC copy back into the original
+        before scoring.
+        """
+        ptc_db = getattr(env, "ptc_db_path", None)
+        if not ptc_db or not os.path.exists(ptc_db):
+            return
+        try:
+            import sqlite3 as _sql
+            ptc_conn = _sql.connect(ptc_db)
+            ptc_tables = {r[0] for r in ptc_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            ptc_conn.close()
+
+            orig_conn = _sql.connect(env.db_path)
+            orig_tables = {r[0] for r in orig_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+
+            new_tables = ptc_tables - orig_tables
+            new_tables = {t for t in new_tables if not t.startswith("sqlite_")}
+            if new_tables:
+                orig_conn.execute("ATTACH DATABASE ? AS ptc", (ptc_db,))
+                for tbl in new_tables:
+                    orig_conn.execute(
+                        f'CREATE TABLE main."{tbl}" AS SELECT * FROM ptc."{tbl}"'
+                    )
+                orig_conn.commit()
+                orig_conn.execute("DETACH DATABASE ptc")
+            orig_conn.close()
+        except Exception as exc:
+            logger.warning("Failed to merge PTC DB writes for %s: %s", env.task_name, exc)
 
     async def _handle_pending_state(
         self, agent_data: TaskSyncAgentData, sampling_params: dict[str, Any]
@@ -838,6 +892,7 @@ env = _mod.Task_Env(db_path={repr(env.db_path)}, workspace={repr(env.workspace)}
         if tool_name == "claim_done":
             action = arguments.get("action", "")
             try:
+                self._merge_ptc_db_writes(env)
                 reward, info = env.step(action)
                 raw_reward = float(reward)
                 if raw_reward < 0.0 or raw_reward > 1.0:

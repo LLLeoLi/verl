@@ -65,8 +65,8 @@ def _log_once(key: str, level: int, msg: str) -> None:
 # (the primary cap, see cgroup_mem_max below) and the fallback RLIMIT_AS used
 # only when the cgroup is unavailable. Override via the `mem_limit_bytes` kwarg
 # to StatefulSandbox or the VERL_SANDBOX_MEM_LIMIT_BYTES env var. 0 disables it.
-# 4GiB is generous for the lightweight tasksync tool sandboxes.
-_DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_SANDBOX_MEM_LIMIT_BYTES", str(4 * 1024**3)))
+# 2GiB is sufficient for the lightweight tasksync tool sandboxes.
+_DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_SANDBOX_MEM_LIMIT_BYTES", str(2 * 1024**3)))
 
 # Cap on the output string a single execute() call may return (chars). Rollouts
 # occasionally print entire fetched datasets (hundreds of KB), which blows past

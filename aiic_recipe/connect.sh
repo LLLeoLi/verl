@@ -49,6 +49,17 @@ Host HKUST-NLP
   HostName jxcpu1.cse.ust.hk
   User lihao
   ProxyJump Proxy-RAS
+
+Host dev
+  HostName 180.184.148.144
+  User root
+  Port 2022
+
+Host ST_agent_03
+  HostName 180.184.148.144
+  ProxyCommand ssh -W %h:%p dev
+  User root
+  Port 8022
 EOF
 
 chmod 600 "$CONFIG_PATH"
@@ -64,20 +75,49 @@ cat "${KEY_PATH}.pub"
 echo ""
 echo "=========================================="
 
-# --- Step 4: 等待用户确认并输入端口后建立反向端口转发 ---
+# --- Step 4: 选择连接的目标机器 ---
+echo ""
+echo "=========================================="
+echo "请选择要连接的目标机器："
+echo "  0) HKUST-NLP (jxcpu1.cse.ust.hk)"
+echo "  1) dev (JD 开发机)"
+echo "=========================================="
+read -p "请输入选项 [0/1] (默认 0): " MACHINE_CHOICE
+MACHINE_CHOICE=${MACHINE_CHOICE:-0}
+
+case "$MACHINE_CHOICE" in
+    0)
+        TARGET_HOST="HKUST-NLP"
+        DEFAULT_REMOTE_PORT=18025
+        DEFAULT_LOCAL_PORT=8025
+        ;;
+    1)
+        TARGET_HOST="dev"
+        DEFAULT_REMOTE_PORT=18025
+        DEFAULT_LOCAL_PORT=8025
+        ;;
+    *)
+        echo "❌ 无效选项，退出。"
+        exit 1
+        ;;
+esac
+
+echo "✅ 已选择: $TARGET_HOST"
+
+# --- Step 5: 等待用户确认并输入端口后建立反向端口转发 ---
 echo ""
 read -p "✅ 公钥添加完成后，按 Enter 键继续配置端口转发..." _
 
 echo ""
-read -p "请输入远程端口号 (默认 18025): " REMOTE_PORT
-REMOTE_PORT=${REMOTE_PORT:-18025}
+read -p "请输入远程端口号 (默认 $DEFAULT_REMOTE_PORT): " REMOTE_PORT
+REMOTE_PORT=${REMOTE_PORT:-$DEFAULT_REMOTE_PORT}
 
-read -p "请输入本地端口号 (默认 8025): " LOCAL_PORT
-LOCAL_PORT=${LOCAL_PORT:-8025}
+read -p "请输入本地端口号 (默认 $DEFAULT_LOCAL_PORT): " LOCAL_PORT
+LOCAL_PORT=${LOCAL_PORT:-$DEFAULT_LOCAL_PORT}
 
 echo ""
 echo "🔗 正在建立反向端口转发 (远程 $REMOTE_PORT -> 本地 $LOCAL_PORT)..."
-echo "   命令: ssh -N -R $REMOTE_PORT:127.0.0.1:$LOCAL_PORT HKUST-NLP"
+echo "   命令: ssh -N -R $REMOTE_PORT:127.0.0.1:$LOCAL_PORT $TARGET_HOST"
 echo ""
 
 ssh -v -N \
@@ -85,4 +125,4 @@ ssh -v -N \
     -o ServerAliveCountMax=3 \
     -o ExitOnForwardFailure=yes \
     -R "$REMOTE_PORT":127.0.0.1:"$LOCAL_PORT" \
-    HKUST-NLP
+    "$TARGET_HOST"
