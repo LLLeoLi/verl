@@ -239,6 +239,10 @@ TRAIN_CMD=(
     actor_rollout_ref.actor.optim.lr_warmup_steps=${lr_warmup_steps}
     actor_rollout_ref.actor.optim.lr_decay_style='constant'
     actor_rollout_ref.actor.optim.weight_decay=${weight_decay}
+    # On resume, restore the Megatron LR scheduler's num_steps from the checkpoint
+    # instead of re-running warmup from 0. Without this the scheduler defaults to
+    # override mode and the LR ramps 0->max again over lr_warmup_steps every resume.
+    actor_rollout_ref.actor.optim.use_checkpoint_opt_param_scheduler=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=${offload_fraction}
     +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
