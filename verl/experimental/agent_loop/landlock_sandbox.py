@@ -169,6 +169,14 @@ def bwrap_usable() -> bool:
 _CGROUP_ENABLE = os.getenv("VERL_SANDBOX_CGROUP_ENABLE", "1") != "0"
 _CGROUP_ROOT = os.getenv("VERL_SANDBOX_CGROUP_ROOT", "/sys/fs/cgroup/verl_sandbox")
 _CGROUP_PIDS_MAX = os.getenv("VERL_SANDBOX_CGROUP_PIDS_MAX", "256")
+# Aggregate memory.max on the PARENT cgroup, capping the sandbox subtree as a
+# whole. The per-leaf 2GiB caps bound one kernel, but their sum scales with
+# the admission cap (slots x 2 kernels x 2GiB) and can still crowd the node.
+# With the parent capped, worst case is the kernel OOM-killing one sandbox
+# process inside the subtree -- that episode fails and training continues --
+# instead of the host OOM killer taking out the Ray runtime. Unset/empty =
+# auto (25% of MemTotal); "0" disables the aggregate cap.
+_CGROUP_TOTAL_MEM_ENV = os.getenv("VERL_SANDBOX_CGROUP_TOTAL_MEM_BYTES") or ""
 _CGROUP_BASE_READY = False
 _CGROUP_BASE_LOCK = threading.Lock()
 
@@ -241,7 +249,14 @@ async def sandbox_startup_gate():
 # Process-wide, i.e. PER AgentLoopWorker, and shared by every agent loop in
 # the worker -- the slot accounting below must be global so the idle sweep
 # (kill_all_kernels when in-flight hits zero) cannot fire while another loop
-_DEFAULT_MAX_CONCURRENT_ROLLOUTS = 64
+# still holds a slot. Workers are scheduled one-per-node, so this is
+# effectively the per-node cap on live episodes: with ptc_mode=ptc each slot
+# holds up to 2 kernels x VERL_SANDBOX_MEM_LIMIT_BYTES of cgroup budget, plus
+# an in-process Task_Env. `or` (not a getenv default) so an empty string from
+# a Ray runtime_env passthrough doesn't crash int().
+_DEFAULT_MAX_CONCURRENT_ROLLOUTS = int(
+    os.getenv("VERL_TASKSYNC_MAX_CONCURRENT_ROLLOUTS") or "64"
+)
 _ROLLOUT_SEM: asyncio.Semaphore | None = None
 
 # Episodes currently holding an admission slot. Maintained on the event-loop
@@ -257,6 +272,77 @@ def _get_rollout_sem() -> asyncio.Semaphore:
     return _ROLLOUT_SEM
 
 
+# --- memory-floor admission -------------------------------------------------
+# The slot semaphore bounds the sandbox population, but plenty of node memory
+# lives outside any cgroup: the Task_Env graders run in-process in the
+# AgentLoopWorker, vLLM's CPU side, Megatron's optimizer offload, the Ray
+# object store. When their sum leaves the node close to exhaustion, admitting
+# more episodes is what turns pressure into the kernel OOM killer taking out
+# the whole `ray start` tree (and with it the training job). So on top of the
+# slot count, hold new admissions while MemAvailable is under a floor.
+#
+# Floor: VERL_SANDBOX_MEM_FLOOR_BYTES, or 5% of MemTotal when unset/empty
+# (~100GiB on a 2TB node). Waiters poll every _MEM_FLOOR_POLL_S; existing
+# episodes keep running and finishing, so pressure drains. If the floor is
+# still unmet after VERL_SANDBOX_MEM_FLOOR_MAX_WAIT_S the waiter proceeds
+# anyway -- when something *outside* rollouts holds the memory, stalling the
+# step forever is strictly worse than the OOM risk we came in with.
+_MEM_FLOOR_POLL_S = 5.0
+_MEM_FLOOR_MAX_WAIT_S = float(os.getenv("VERL_SANDBOX_MEM_FLOOR_MAX_WAIT_S") or "600")
+_MEM_FLOOR_BYTES: int | None = None  # resolved lazily; 0 disables the check
+_LAST_FLOOR_LOG = 0.0
+
+
+def _read_meminfo_bytes(field: str) -> int | None:
+    """Read a /proc/meminfo field (kB) as bytes; None if unreadable."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _get_mem_floor_bytes() -> int:
+    global _MEM_FLOOR_BYTES
+    if _MEM_FLOOR_BYTES is None:
+        env_val = os.getenv("VERL_SANDBOX_MEM_FLOOR_BYTES") or ""
+        if env_val:
+            _MEM_FLOOR_BYTES = int(env_val)
+        else:
+            total = _read_meminfo_bytes("MemTotal")
+            _MEM_FLOOR_BYTES = int(total * 0.05) if total else 0
+    return _MEM_FLOOR_BYTES
+
+
+async def _wait_for_memory_headroom() -> None:
+    floor = _get_mem_floor_bytes()
+    if floor <= 0:
+        return
+    global _LAST_FLOOR_LOG
+    waited = 0.0
+    while waited < _MEM_FLOOR_MAX_WAIT_S:
+        avail = _read_meminfo_bytes("MemAvailable")
+        if avail is None or avail >= floor:
+            return
+        now = time.monotonic()
+        if now - _LAST_FLOOR_LOG > 60.0:
+            _LAST_FLOOR_LOG = now
+            logger.warning(
+                f"[sandbox] node MemAvailable {avail / 2**30:.1f}GiB below floor "
+                f"{floor / 2**30:.1f}GiB; holding new rollout admissions "
+                f"({_INFLIGHT_ROLLOUTS} in flight)."
+            )
+        await asyncio.sleep(_MEM_FLOOR_POLL_S)
+        waited += _MEM_FLOOR_POLL_S
+    logger.warning(
+        f"[sandbox] memory floor still unmet after {_MEM_FLOOR_MAX_WAIT_S:.0f}s; "
+        f"admitting rollout anyway to avoid stalling the step."
+    )
+
+
 async def acquire_rollout_slot() -> None:
     """Block until this episode may hold live sandboxes (see _ROLLOUT_SEM).
 
@@ -265,6 +351,14 @@ async def acquire_rollout_slot() -> None:
     """
     global _INFLIGHT_ROLLOUTS
     await _get_rollout_sem().acquire()
+    try:
+        # Memory check runs while holding the slot so waiters also count
+        # against the concurrency cap; released on cancellation so a slot is
+        # never leaked before the caller's release pairing is armed.
+        await _wait_for_memory_headroom()
+    except BaseException:
+        _get_rollout_sem().release()
+        raise
     _INFLIGHT_ROLLOUTS += 1
 
 
@@ -724,6 +818,32 @@ def _ensure_cgroup_base() -> bool:
                     f.write("+memory +pids")
             except OSError:
                 pass
+            # Aggregate cap over the whole sandbox subtree (see
+            # _CGROUP_TOTAL_MEM_ENV). Best effort: requires the memory
+            # controller enabled in _CGROUP_ROOT's parent.
+            total_mem_max = 0
+            if _CGROUP_TOTAL_MEM_ENV:
+                total_mem_max = int(_CGROUP_TOTAL_MEM_ENV)
+            else:
+                mem_total = _read_meminfo_bytes("MemTotal")
+                total_mem_max = int(mem_total * 0.25) if mem_total else 0
+            if total_mem_max > 0:
+                try:
+                    with open(os.path.join(_CGROUP_ROOT, "memory.max"), "w") as f:
+                        f.write(str(total_mem_max))
+                    with open(os.path.join(_CGROUP_ROOT, "memory.swap.max"), "w") as f:
+                        f.write("0")
+                    logger.info(
+                        f"[sandbox] aggregate sandbox memory.max set to "
+                        f"{total_mem_max / 2**30:.0f}GiB on {_CGROUP_ROOT}"
+                    )
+                except OSError as e:
+                    _log_once(
+                        "cgroup_total_mem_failed",
+                        logging.WARNING,
+                        f"[sandbox] could not set aggregate memory.max on "
+                        f"{_CGROUP_ROOT} ({e}); per-leaf caps only (logged once).",
+                    )
             _CGROUP_BASE_READY = True
             return True
         except OSError as e:

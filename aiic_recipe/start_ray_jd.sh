@@ -146,7 +146,11 @@ else
             \"http_proxy\": \"${http_proxy:-}\",
             \"https_proxy\": \"${https_proxy:-}\",
             \"HTTP_PROXY\": \"${HTTP_PROXY:-}\",
-            \"HTTPS_PROXY\": \"${HTTPS_PROXY:-}\"
+            \"HTTPS_PROXY\": \"${HTTPS_PROXY:-}\",
+            \"VERL_TASKSYNC_MAX_CONCURRENT_ROLLOUTS\": \"${VERL_TASKSYNC_MAX_CONCURRENT_ROLLOUTS:-32}\",
+            \"VERL_SANDBOX_CGROUP_TOTAL_MEM_BYTES\": \"${VERL_SANDBOX_CGROUP_TOTAL_MEM_BYTES:-}\",
+            \"VERL_SANDBOX_MEM_FLOOR_BYTES\": \"${VERL_SANDBOX_MEM_FLOOR_BYTES:-}\",
+            \"VERL_SANDBOX_MEM_FLOOR_MAX_WAIT_S\": \"${VERL_SANDBOX_MEM_FLOOR_MAX_WAIT_S:-}\"
         }
         }"
 

@@ -388,7 +388,16 @@ class TaskSyncTrainer(RayPPOTrainer):
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
 
-        current_epoch = self.global_steps // max(1, len(self.train_dataloader))
+        # Resume position comes from the checkpoint's training_state (epoch +
+        # next batch index), NOT from ``global_steps // steps_per_epoch``: the
+        # division breaks whenever global_steps and dataloader consumption
+        # desync (e.g. filter_groups' continue path), and it carries no
+        # intra-epoch position at all. The inner loop below fast-forwards past
+        # already-trained batches of the resumed epoch; without that skip every
+        # mid-epoch resume replayed the epoch from batch 0 (duplicate training
+        # on the epoch head, tail of the data never seen before the
+        # total_training_steps cap).
+        current_epoch = self._resume_epoch
 
         if self.val_planning_dataset is not None and self.config.trainer.get("val_before_train", False):
             val_metrics = self._validate()
@@ -414,6 +423,13 @@ class TaskSyncTrainer(RayPPOTrainer):
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_idx, _ in enumerate(self.train_dataloader):
+                # Fast-forward to the resume point within the resumed epoch.
+                # Skipped batches consume neither global_steps nor data: the
+                # dataset state (rng + shuffled order) restored from the
+                # checkpoint keeps get_batch(batch_idx) aligned, preserving the
+                # invariant global_steps == epoch * steps_per_epoch + batch_idx + 1.
+                if epoch == self._resume_epoch and batch_idx < self._resume_batch_idx:
+                    continue
                 self._current_epoch = epoch
                 self._current_batch_idx = batch_idx
                 metrics: dict = {}
@@ -1095,18 +1111,26 @@ class TaskSyncTrainer(RayPPOTrainer):
             self._resume_batch_idx = training_state["batch_idx"] + 1
             if "dataset_state" in training_state:
                 self.planning_dataset.load_state_dict(training_state["dataset_state"])
-            logger.info(
-                f"Restored training state: epoch={self._resume_epoch}, "
-                f"batch_idx={self._resume_batch_idx}, global_steps={self.global_steps}"
-            )
         else:
             steps_per_epoch = len(self.planning_dataset)
             self._resume_epoch = self.global_steps // max(1, steps_per_epoch)
             self._resume_batch_idx = self.global_steps % max(1, steps_per_epoch)
             logger.warning(
-                f"No training_state.pt found, estimating resume position: "
-                f"epoch={self._resume_epoch}, batch_idx={self._resume_batch_idx}"
+                f"No training_state.pt found, estimating resume position from global_steps"
             )
+
+        # Carry: a checkpoint on an epoch's last batch means "resume at the
+        # next epoch's batch 0", otherwise fit()'s fast-forward would skip the
+        # whole (already finished) epoch's worth of batches... of the wrong
+        # epoch. steps_per_epoch mirrors len(train_dataloader) in fit().
+        steps_per_epoch = max(1, len(self.planning_dataset))
+        if self._resume_batch_idx >= steps_per_epoch:
+            self._resume_epoch += 1
+            self._resume_batch_idx = 0
+        logger.info(
+            f"Restored training state: resume_epoch={self._resume_epoch}, "
+            f"resume_batch_idx={self._resume_batch_idx}, global_steps={self.global_steps}"
+        )
 
     # ------------------------------------------------------------------
     # Experience dumping
