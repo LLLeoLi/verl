@@ -52,6 +52,7 @@ from verl.experimental.agent_loop.landlock_sandbox import (
     sandbox_startup_gate,
     teardown_env,
     track_env_dir,
+    truncate_output,
 )
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
 from verl.utils.profiler import simple_timer
@@ -60,6 +61,15 @@ from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+# Hard cap (chars) on ANY tool observation before it is appended to the
+# conversation and tokenized. The sandbox already truncates its own output, but
+# env tools (json.dumps of arbitrary query results) and claim_done info dumps
+# did not — observed blowups tokenized to 53M tokens (~200MB text), whose
+# encode + token list + retained message OOM-killed the node's Ray processes.
+# 0 disables. Keep >= the sandbox's VERL_SANDBOX_MAX_OUTPUT_CHARS (50k default)
+# so normal sandbox output passes through untouched.
+_MAX_OBS_CHARS = int(os.getenv("VERL_TASKSYNC_MAX_OBS_CHARS") or "65536")
 
 # Wall-clock budget for the one-shot setup_code (import env.py + construct
 # Task_Env + install the tools proxy). This runs while up to
@@ -604,15 +614,19 @@ class TaskSyncAgentLoop(AgentLoopBase):
                 if os.path.exists(src):
                     shutil.copy2(src, os.path.join(env_dir, fname))
 
+            # stdout is never consumed — discard it instead of buffering an
+            # arbitrarily verbose data.py in this process. stderr is only used
+            # for the error message, tail-capped below.
             r = subprocess.run(
                 [sys.executable, "data.py", "--db_path", "data.db", "--workspace", "workspace"],
                 cwd=env_dir,
-                capture_output=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 timeout=self.data_py_timeout,
             )
             if r.returncode != 0:
-                raise RuntimeError(f"data.py failed for {task_name}:\n{r.stderr}")
+                raise RuntimeError(f"data.py failed for {task_name}:\n{r.stderr[-10000:]}")
         except Exception:
             cleanup_env_dir(env_dir)
             raise
@@ -829,6 +843,16 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             observation, reward, done = await self._execute_tool(
                 env, tool_name, tool_args, agent_data, reward_type=reward_type
             )
+            # Single choke point bounding every observation (env tools,
+            # claim_done info, terminal, sandboxes) before it reaches the
+            # message list / tokenizer. See _MAX_OBS_CHARS.
+            if _MAX_OBS_CHARS > 0 and len(observation) > _MAX_OBS_CHARS:
+                print(
+                    f"[tasksync][oversized-obs] task={env.task_name} tool={tool_name} "
+                    f"chars={len(observation)} truncated_to={_MAX_OBS_CHARS}",
+                    flush=True,
+                )
+                observation = truncate_output(observation, _MAX_OBS_CHARS)
             tool_messages.append({"role": "tool", "content": observation, "name": tool_name})
 
             if done:
@@ -1289,22 +1313,6 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             "tool_call_parse_error_count": agent_data.tool_call_parse_error_count,
         }
         output.extra_fields["messages"] = agent_data.messages
-
-        # Emitted via print (not logger.info) so it always reaches the driver
-        # console: Ray forwards worker stdout regardless of the logger's effective
-        # level, which inside the rollout worker is raised above INFO.
-        print(
-            "[rollout] task={} reward={:.4f} (raw={:.4f}) success={} turns={} len={}{}".format(
-                getattr(agent_data.env, "task_name", "?"),
-                penalized_reward,
-                float(agent_data.final_reward),
-                agent_data.success,
-                agent_data.assistant_turns,
-                rollout_length,
-                " [truncated]" if is_truncated else "",
-            ),
-            flush=True,
-        )
 
         return output
 

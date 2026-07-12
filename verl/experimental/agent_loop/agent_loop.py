@@ -525,6 +525,13 @@ class AgentLoopWorker:
             trace_config.get("max_samples_per_step_per_worker", None),
         )
 
+        # One AgentLoopWorker is placed per node (round-robin in
+        # _init_agent_loop_workers), so this gives a per-node memory-trend log
+        # ("[node-mem] ...") for diagnosing OOM-killed Ray workers.
+        from verl.experimental.agent_loop.node_mem_monitor import start_node_mem_monitor
+
+        start_node_mem_monitor()
+
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
 

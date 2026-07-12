@@ -49,6 +49,7 @@ from verl.experimental.agent_loop.landlock_sandbox import (
     sandbox_startup_gate,
     teardown_env,
     track_env_dir,
+    truncate_output,
 )
 from verl.experimental.agent_loop.terminal import TerminalError, TerminalExecutor
 from verl.utils.profiler import simple_timer
@@ -57,6 +58,11 @@ from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+# Hard cap (chars) on ANY tool observation before it is appended to the
+# conversation and tokenized. See tasksync_agent_loop._MAX_OBS_CHARS for the
+# OOM rationale. 0 disables.
+_MAX_OBS_CHARS = int(os.getenv("VERL_TASKSYNC_MAX_OBS_CHARS") or "65536")
 
 # See tasksync_agent_loop._SANDBOX_SETUP_TIMEOUT for rationale: budget for the
 # one-shot setup_code, widened so transient bring-up contention does not drop a
@@ -514,15 +520,19 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
                 if os.path.exists(src):
                     shutil.copy2(src, os.path.join(env_dir, fname))
 
+            # stdout is never consumed — discard it instead of buffering an
+            # arbitrarily verbose data.py in this process. stderr is only used
+            # for the error message, tail-capped below.
             r = subprocess.run(
                 [sys.executable, "data.py", "--db_path", "data.db", "--workspace", "workspace"],
                 cwd=env_dir,
-                capture_output=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 timeout=self.data_py_timeout,
             )
             if r.returncode != 0:
-                raise RuntimeError(f"data.py failed for {task_name}:\n{r.stderr}")
+                raise RuntimeError(f"data.py failed for {task_name}:\n{r.stderr[-10000:]}")
         except Exception:
             cleanup_env_dir(env_dir)
             raise
@@ -727,6 +737,15 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                 observation = json.dumps({"error": f"Tool execution failed: {e}"})
                 reward = 0.0
                 done = False
+            # Single choke point bounding every observation before it reaches
+            # the message list / tokenizer. See _MAX_OBS_CHARS.
+            if _MAX_OBS_CHARS > 0 and len(observation) > _MAX_OBS_CHARS:
+                print(
+                    f"[tasksync][oversized-obs] task={env.task_name} tool={tool_name} "
+                    f"chars={len(observation)} truncated_to={_MAX_OBS_CHARS}",
+                    flush=True,
+                )
+                observation = truncate_output(observation, _MAX_OBS_CHARS)
             tool_messages.append({"role": "tool", "content": observation, "name": tool_name})
 
             if done:
@@ -1076,17 +1095,6 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             "env_tool_count": 0,
         }
         output.extra_fields["messages"] = agent_data.messages
-
-        logger.info(
-            "[rollout] task=%s reward=%.4f (raw=%.4f) success=%s turns=%d len=%d%s",
-            getattr(agent_data.env, "task_name", "?"),
-            penalized_reward,
-            float(agent_data.final_reward),
-            agent_data.success,
-            agent_data.assistant_turns,
-            rollout_length,
-            " [truncated]" if is_truncated else "",
-        )
 
         return output
 

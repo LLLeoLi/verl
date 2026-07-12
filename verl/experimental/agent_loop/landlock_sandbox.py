@@ -25,6 +25,7 @@ Isolation strategy (layered):
 """
 
 import asyncio
+import collections
 import concurrent.futures
 import contextlib
 import ctypes
@@ -541,6 +542,58 @@ def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from text."""
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
+
+
+class _BoundedStreamBuffer:
+    """Accumulates kernel stream text with a bounded memory footprint.
+
+    Keeps a fixed head plus a rolling tail (so the final traceback stays
+    visible) and drops the middle DURING accumulation. Previously the full
+    stream was accumulated and truncate_output applied only after execution
+    finished, so a print-storm could balloon the worker process RSS by
+    (timeout x zmq throughput) bytes before truncation ever ran.
+
+    ``head_cap``/``tail_cap`` <= 0 disables the bound (old behavior).
+    """
+
+    def __init__(self, head_cap: int, tail_cap: int):
+        self._head: list[str] = []
+        self._head_len = 0
+        self._tail: collections.deque = collections.deque()
+        self._tail_len = 0
+        self._dropped = 0
+        self._head_cap = head_cap
+        self._tail_cap = tail_cap
+
+    def append(self, text: str) -> None:
+        if not text:
+            return
+        if self._head_cap <= 0 or self._tail_cap <= 0:
+            self._head.append(text)
+            return
+        if self._head_len < self._head_cap:
+            take = min(len(text), self._head_cap - self._head_len)
+            self._head.append(text[:take])
+            self._head_len += take
+            text = text[take:]
+            if not text:
+                return
+        if len(text) > self._tail_cap:
+            self._dropped += len(text) - self._tail_cap
+            text = text[-self._tail_cap :]
+        self._tail.append(text)
+        self._tail_len += len(text)
+        while self._tail_len > self._tail_cap:
+            chunk = self._tail.popleft()
+            self._tail_len -= len(chunk)
+            self._dropped += len(chunk)
+
+    def value(self) -> str:
+        head = "".join(self._head)
+        tail = "".join(self._tail)
+        if self._dropped:
+            return f"{head}\n...[{self._dropped} chars dropped during execution]...\n{tail}"
+        return head + tail
 
 
 def truncate_output(text: str, limit: int) -> str:
@@ -1372,8 +1425,16 @@ class StatefulSandbox:
         effective_timeout = self.timeout if timeout is None else timeout
         deadline = time.time() + effective_timeout
 
-        out_parts: list[str] = []
-        err_parts: list[str] = []
+        # Bound the in-flight accumulation (not just the final result): a
+        # print-storm can stream far more than max_output_chars before the
+        # execution finishes, and truncate_output only runs at the end.
+        if self.max_output_chars > 0:
+            head_cap = max(2 * self.max_output_chars, 131072)
+            tail_cap = max(self.max_output_chars, 65536)
+        else:
+            head_cap = tail_cap = 0  # truncation disabled -> unbounded
+        out_parts = _BoundedStreamBuffer(head_cap, tail_cap)
+        err_parts = _BoundedStreamBuffer(head_cap, tail_cap)
         success = True
 
         while True:
@@ -1419,7 +1480,7 @@ class StatefulSandbox:
             elif msg_type == "status" and content.get("execution_state") == "idle":
                 break
 
-        return strip_ansi("".join(out_parts)), strip_ansi("".join(err_parts)), success
+        return strip_ansi(out_parts.value()), strip_ansi(err_parts.value()), success
 
     def execute(self, code: str, timeout: float | None = None) -> tuple[str, bool]:
         """Execute code and return (output, success).

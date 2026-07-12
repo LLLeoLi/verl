@@ -5,6 +5,7 @@ import os
 import resource
 import signal
 import subprocess
+import threading
 
 from verl.experimental.agent_loop.landlock_sandbox import (
     _CGROUP_ENABLE,
@@ -21,6 +22,15 @@ from verl.experimental.agent_loop.landlock_sandbox import (
 # bounded either way. Override via the `mem_limit_bytes` kwarg or the
 # VERL_TERMINAL_MEM_LIMIT_BYTES env var. 0 disables the cap.
 _DEFAULT_MEM_LIMIT_BYTES = int(os.getenv("VERL_TERMINAL_MEM_LIMIT_BYTES", str(4 * 1024**3)))
+
+# Cap on how many chars of stdout/stderr are KEPT in this process. The old
+# communicate() path buffered the child's entire output in the AgentLoopWorker
+# process, so a single `cat big_file` / `yes`-style command could balloon the
+# worker's RSS by hundreds of MB-GBs and get the node's Ray processes
+# OOM-killed (observed as tool observations tokenizing to 53M tokens). Output
+# beyond the cap is drained (so the child never blocks on a full pipe) but
+# discarded. Override via env var; 0 disables the cap.
+_DEFAULT_MAX_CAPTURE_CHARS = int(os.getenv("VERL_TERMINAL_MAX_CAPTURE_CHARS") or str(1 * 1024**2))
 
 # Per-command cgroup leaf names: term_<pid>_<n>, unique within a worker process.
 _LEAF_COUNTER = itertools.count()
@@ -117,8 +127,15 @@ class TerminalExecutor:
             except Exception as e:
                 raise TerminalError(f"Execution failed: {e}")
 
+            # Drain stdout/stderr on background threads, keeping at most
+            # _DEFAULT_MAX_CAPTURE_CHARS per stream. Draining (vs not reading)
+            # keeps the child from blocking on a full pipe; capping (vs
+            # communicate()) keeps a runaway `cat`/`yes` from ballooning THIS
+            # process's RSS until the node's Ray processes are OOM-killed.
+            out_state = self._drain_stream(proc.stdout)
+            err_state = self._drain_stream(proc.stderr)
             try:
-                stdout, stderr = proc.communicate(timeout=self.timeout)
+                proc.wait(timeout=self.timeout)
                 returncode = proc.returncode
             except subprocess.TimeoutExpired:
                 try:
@@ -126,14 +143,22 @@ class TerminalExecutor:
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
                 try:
-                    stdout, stderr = proc.communicate(timeout=2)
+                    proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     try:
                         proc.kill()
                     except Exception:
                         pass
-                    stdout, stderr = "", ""
                 raise TerminalError(f"Command timed out after {self.timeout}s")
+            finally:
+                # Threads hit EOF once the process (group) is dead and the pipe
+                # write ends close; the join timeout guards against a lingering
+                # grandchild holding the pipe open.
+                out_state["thread"].join(timeout=5)
+                err_state["thread"].join(timeout=5)
+
+            stdout = self._collect_stream(out_state, "stdout")
+            stderr = self._collect_stream(err_state, "stderr")
         finally:
             # Reclaim the leaf once the process group is gone. rmdir fails if a
             # backgrounded child still lingers; the idle sweep
@@ -150,3 +175,41 @@ class TerminalExecutor:
         if not output.strip():
             output = f"(no output, exit code: {returncode})"
         return output
+
+    @staticmethod
+    def _drain_stream(stream) -> dict:
+        """Start a daemon thread that reads `stream` to EOF, keeping only the
+        first _DEFAULT_MAX_CAPTURE_CHARS chars. Returns the shared state dict:
+        {"chunks": [...], "kept": int, "total": int, "thread": Thread}."""
+        cap = _DEFAULT_MAX_CAPTURE_CHARS
+        state = {"chunks": [], "kept": 0, "total": 0}
+
+        def _drain():
+            try:
+                while True:
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        break
+                    state["total"] += len(chunk)
+                    if cap <= 0 or state["kept"] < cap:
+                        keep = chunk if cap <= 0 else chunk[: cap - state["kept"]]
+                        state["chunks"].append(keep)
+                        state["kept"] += len(keep)
+            except (OSError, ValueError):
+                pass  # pipe closed mid-read (e.g. after killpg)
+
+        t = threading.Thread(target=_drain, daemon=True)
+        t.start()
+        state["thread"] = t
+        return state
+
+    @staticmethod
+    def _collect_stream(state: dict, name: str) -> str:
+        text = "".join(state["chunks"])
+        dropped = state["total"] - state["kept"]
+        if dropped > 0:
+            text += (
+                f"\n...[{name} truncated: {dropped} chars dropped; "
+                f"pipe large output through head/tail/grep instead]..."
+            )
+        return text
