@@ -244,5 +244,29 @@ else
                   --min-worker-port=0 \
                   --max-worker-port=0 \
                   --block
+        rc=$?
+
+        # ------------------------------------------------------------------
+        # Post-mortem: ray start --block should never exit on its own. Dump
+        # everything that identifies WHO killed it (kernel OOM in the pod
+        # cgroup vs an external platform agent) before the container goes away.
+        # ------------------------------------------------------------------
+        echo "[worker-diag] ray start exited rc=$rc at $(date -u +%FT%TZ) on $(hostname)"
+        echo "[worker-diag] pid_max: $(cat /proc/sys/kernel/pid_max 2>/dev/null)"
+        echo "[worker-diag] cgroup memory.events (oom_kill>0 => kernel OOM inside pod):"
+        cat /sys/fs/cgroup/memory.events 2>/dev/null || \
+            grep -H "" /sys/fs/cgroup/memory/memory.oom_control 2>/dev/null
+        echo "[worker-diag] cgroup memory.peak / current / max:"
+        cat /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.max 2>/dev/null
+        echo "[worker-diag] dmesg oom/kill/xid tail:"
+        dmesg -T 2>/dev/null | grep -iE "out of memory|oom|killed process|xid|nvrm" | tail -40 || \
+            echo "  (dmesg unavailable in container)"
+        echo "[worker-diag] ray process exit log:"
+        tail -60 /tmp/ray/session_*/logs/ray_process_exit.log 2>/dev/null
+        echo "[worker-diag] nvidia-smi health:"
+        nvidia-smi --query-gpu=index,name,memory.used,utilization.gpu --format=csv 2>&1 | head -12
+        # Give the platform's log agent time to ship the lines above.
+        sleep 90
+        exit "$rc"
     fi
 fi

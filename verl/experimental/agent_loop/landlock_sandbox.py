@@ -184,8 +184,26 @@ _CGROUP_BASE_LOCK = threading.Lock()
 _KERNEL_START_LOCK = threading.Lock()
 
 # Track all spawned kernel PIDs so we can force-kill stragglers between envs.
-_SPAWNED_PIDS: set[int] = set()
+# Maps pid -> /proc/<pid>/stat starttime captured at registration. The sweep
+# verifies the starttime still matches before killing: a kernel that died
+# without passing through a discard path leaves a stale entry, and hours later
+# (after pid wraparound) that pid can belong to an unrelated process — e.g. a
+# Ray worker — which a blind SIGKILL would take down.
+_SPAWNED_PIDS: dict[int, int | None] = {}
 _PID_LOCK = threading.Lock()
+
+
+def _proc_starttime(pid: int) -> int | None:
+    """Kernel starttime (clock ticks since boot) of `pid`, or None if gone.
+    (pid, starttime) uniquely identifies a process across pid reuse."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+        # Field 22 counting from 1, but fields 1-2 include the parenthesized
+        # comm which may contain spaces — split after the closing paren.
+        return int(data[data.rfind(")") + 2 :].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
 
 # prctl(PR_SET_PDEATHSIG, sig) -- kernel sends `sig` to this process when its
 # parent dies. Linux-only; key=1 per <sys/prctl.h>. Preserved across execve()
@@ -644,8 +662,24 @@ def _find_child_pid(ppid: int) -> int | None:
     return None
 
 
-def _force_kill_pid(pid: int):
-    """Best-effort kill a process group, then the PID itself."""
+def _force_kill_pid(pid: int, expected_starttime: int | None = None):
+    """Best-effort kill a process group, then the PID itself.
+
+    When `expected_starttime` is given, the kill is skipped if the live
+    process's starttime no longer matches — the pid has been recycled to an
+    unrelated process (possibly a Ray daemon/actor) and must not be touched.
+    """
+    if expected_starttime is not None:
+        current = _proc_starttime(pid)
+        if current is None:
+            return  # already gone
+        if current != expected_starttime:
+            print(
+                f"[sandbox] skip stale-PID kill: pid={pid} was recycled "
+                f"(starttime {expected_starttime} -> {current})",
+                flush=True,
+            )
+            return
     for sig in (signal.SIGKILL,):
         try:
             os.killpg(pid, sig)
@@ -660,10 +694,10 @@ def _force_kill_pid(pid: int):
 def kill_all_kernels():
     """Force-kill every kernel process we ever spawned. Call between envs."""
     with _PID_LOCK:
-        pids = list(_SPAWNED_PIDS)
+        pids = dict(_SPAWNED_PIDS)
         _SPAWNED_PIDS.clear()
-    for pid in pids:
-        _force_kill_pid(pid)
+    for pid, starttime in pids.items():
+        _force_kill_pid(pid, expected_starttime=starttime)
     # Reap zombies
     for pid in pids:
         try:
@@ -1210,7 +1244,7 @@ class StatefulSandbox:
             stderr_f.close()  # parent's copy; the child keeps its own dup
 
         with _PID_LOCK:
-            _SPAWNED_PIDS.add(self._proc.pid)
+            _SPAWNED_PIDS[self._proc.pid] = _proc_starttime(self._proc.pid)
 
         deadline = time.time() + 15.0
         while time.time() < deadline:
@@ -1403,7 +1437,7 @@ class StatefulSandbox:
             # sweep would otherwise SIGKILL whatever unrelated process
             # inherited the recycled PID.
             with _PID_LOCK:
-                _SPAWNED_PIDS.discard(proc.pid)
+                _SPAWNED_PIDS.pop(proc.pid, None)
 
     def _run(self, code: str, timeout: float | None = None) -> tuple[str, str, bool]:
         """Execute code in the kernel and return (stdout, stderr, success)."""
@@ -1416,7 +1450,7 @@ class StatefulSandbox:
             # sandbox's cleanup() never runs, a later kill_all_kernels()
             # sweep must not SIGKILL whatever inherited the recycled PID.
             with _PID_LOCK:
-                _SPAWNED_PIDS.discard(self._proc.pid)
+                _SPAWNED_PIDS.pop(self._proc.pid, None)
             raise RuntimeError(
                 f"Kernel process has exited unexpectedly (code {self._proc.returncode})"
             )
@@ -1563,7 +1597,7 @@ class StatefulSandbox:
                 except Exception:
                     pass
             with _PID_LOCK:
-                _SPAWNED_PIDS.discard(pid)
+                _SPAWNED_PIDS.pop(pid, None)
 
         client = self._client
         self._client = None

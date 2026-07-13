@@ -79,6 +79,41 @@ def _read_cgroup_mem() -> tuple[int, int]:
     return -1, -1
 
 
+def _read_cgroup_peak() -> int:
+    """High-water mark of this cgroup's memory (bytes), or -1. Catches spikes
+    that rise and get OOM-killed between two monitor samples."""
+    for path in ("/sys/fs/cgroup/memory.peak", "/sys/fs/cgroup/memory/memory.max_usage_in_bytes"):
+        try:
+            with open(path) as f:
+                return int(f.read())
+        except (OSError, ValueError):
+            continue
+    return -1
+
+
+def _read_cgroup_oom_kills() -> int:
+    """Cumulative count of kernel OOM kills inside this cgroup, or -1.
+    Discriminates 'the pod OOM-killed something' from 'an external agent
+    SIGKILLed our processes' when Ray workers die without memory pressure."""
+    # cgroup v2
+    try:
+        with open("/sys/fs/cgroup/memory.events") as f:
+            for line in f:
+                if line.startswith("oom_kill "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    # cgroup v1
+    try:
+        with open("/sys/fs/cgroup/memory/memory.oom_control") as f:
+            for line in f:
+                if line.startswith("oom_kill "):
+                    return int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return -1
+
+
 def _read_rss(pid: int | str = "self") -> int:
     """RSS in bytes of `pid`, or -1."""
     try:
@@ -119,10 +154,13 @@ def _fmt(nbytes: int) -> str:
 
 def _monitor_loop(interval_s: float) -> None:
     host = socket.gethostname()
+    last_oom_kills = _read_cgroup_oom_kills()
     while True:
         try:
             avail, total = _read_meminfo()
             cg_cur, cg_max = _read_cgroup_mem()
+            cg_peak = _read_cgroup_peak()
+            oom_kills = _read_cgroup_oom_kills()
             self_rss = _read_rss()
             top = _top_rss_procs()
 
@@ -132,11 +170,22 @@ def _monitor_loop(interval_s: float) -> None:
             if cg_max > 0 and cg_cur >= 0 and (cg_max - cg_cur) < 0.10 * cg_max:
                 low = True
 
+            if oom_kills >= 0 and last_oom_kills >= 0 and oom_kills > last_oom_kills:
+                print(
+                    f"[node-mem][OOM-KILL] host={host} kernel oom_kill count "
+                    f"{last_oom_kills} -> {oom_kills} since last sample "
+                    f"(peak={_fmt(cg_peak)}GiB limit={_fmt(cg_max)}GiB)",
+                    flush=True,
+                )
+            last_oom_kills = oom_kills
+
             cg_str = f" cgroup={_fmt(cg_cur)}/{_fmt(cg_max)}GiB" if cg_cur >= 0 else ""
+            peak_str = f" peak={_fmt(cg_peak)}GiB" if cg_peak >= 0 else ""
+            oom_str = f" oom_kills={oom_kills}" if oom_kills > 0 else ""
             top_str = " ".join(f"{c}({p})={_fmt(r)}GiB" for c, p, r in top)
             print(
                 f"[node-mem]{'[LOW]' if low else ''} host={host} "
-                f"avail={_fmt(avail)}/{_fmt(total)}GiB{cg_str} "
+                f"avail={_fmt(avail)}/{_fmt(total)}GiB{cg_str}{peak_str}{oom_str} "
                 f"self_rss={_fmt(self_rss)}GiB top: {top_str}",
                 flush=True,
             )
