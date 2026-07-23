@@ -7,7 +7,8 @@
 #   - response_len bumped to 75000
 #   - parallelism retuned for dense 8B: tp=4 cp=2 pp=1 ep=1
 #   - all MoE-only megatron overrides removed
-#   - tool_call_format=json (Qwen3-8B emits Hermes JSON inside <tool_call>)
+#   - tool_call_format defaults to xml (the ptc-SFT checkpoint emits
+#     Qwen3-Coder-style <function=...> calls inside <tool_call>)
 #
 # Usage (from the verl repo root):
 #   NNODES=2 NGPUS_PER_NODE=8 bash aiic_recipe/train_megatron_qwen3_8b.sh \
@@ -36,6 +37,7 @@ while [[ "$#" -gt 0 ]]; do
         --env_group_size) env_group_size="$2"; shift 2 ;;
         --max_num_batched_tokens) max_num_batched_tokens="$2"; shift 2 ;;
         --temperature) temperature="$2"; shift 2 ;;
+        --clip_ratio_low) clip_ratio_low="$2"; shift 2 ;;
         --clip_ratio_high) clip_ratio_high="$2"; shift 2 ;;
         --total_epochs) total_epochs="$2"; shift 2 ;;
         --loss_mode) loss_mode="$2"; shift 2 ;;
@@ -92,7 +94,12 @@ env_group_size=${env_group_size:-32}
 ppo_mini_bsz=$((env_batch_size * env_group_size))
 
 temperature=${temperature:-1.0}
-clip_ratio_high=${clip_ratio_high:-0.28}
+# GSPO clips the *sequence-level* importance ratio, which hovers near 1, so the
+# clip range must be far tighter than token-level PPO/DAPO values (0.2/0.28
+# would effectively never trigger). Defaults (1e-2/2e-2) are deliberately looser
+# than the GSPO paper (3e-4/4e-4) to tolerate megatron-vs-rollout numerics noise.
+clip_ratio_low=${clip_ratio_low:-1e-2}
+clip_ratio_high=${clip_ratio_high:-2e-2}
 total_epochs=${total_epochs:-5}
 loss_mode=${loss_mode:-gspo}
 actor_lr=${actor_lr:-1e-6}
@@ -142,7 +149,8 @@ dense_epoch=${dense_epoch:-0}
 val_ratio=${val_ratio:-0.0}
 test_freq=${test_freq:--1}
 agent_loop=${agent_loop:-tasksync_agent}
-# Qwen3-8B emits Hermes-style JSON inside <tool_call>...</tool_call>.
+# The ptc-SFT checkpoint emits Qwen3-Coder-style XML (<function=...>) inside
+# <tool_call>...</tool_call>, NOT Hermes JSON — keep the default at xml.
 tool_call_format=${tool_call_format:-xml}
 
 # ==============================================================================
@@ -205,6 +213,7 @@ TRAIN_CMD=(
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_bsz}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${max_token_len_per_gpu}
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low}
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high}
     actor_rollout_ref.actor.policy_loss.loss_mode="${loss_mode}"
     actor_rollout_ref.actor.entropy_coeff=0

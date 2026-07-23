@@ -175,7 +175,6 @@ class TaskSyncTrainer(RayPPOTrainer):
         self.dump_experience_every = int(
             config.actor_rollout_ref.get("dump_experience_every", -1)
         )
-        self.step_count = 0
         self.actor_id = 0
         self.game_state_save_path = os.path.join(
             self.config.trainer.default_local_dir,
@@ -242,11 +241,16 @@ class TaskSyncTrainer(RayPPOTrainer):
         dense_rewards: list[float] = []
         episode_rewards: list[float] = []
         episode_successes: list[bool] = []
+        episode_claim_dones: list[bool] = []
 
         # Per-episode shape
         episode_turns: list[int] = []
         rollout_lengths: list[int] = []
         truncated_flags: list[int] = []
+        generated_tokens: list[int] = []
+        thinking_tokens: list[int] = []
+        ptc_code_tokens: list[int] = []
+        tool_obs_tokens: list[int] = []
 
         # Tool usage
         ptc_counts: list[int] = []
@@ -278,9 +282,14 @@ class TaskSyncTrainer(RayPPOTrainer):
             dense_rewards.extend(_as_list("dense_reward"))
             episode_rewards.extend(_as_list("episode_reward"))
             episode_successes.extend(_as_list("episode_success"))
+            episode_claim_dones.extend(_as_list("episode_claim_done"))
             episode_turns.extend(_as_list("episode_turns"))
             rollout_lengths.extend(_as_list("rollout_length"))
             truncated_flags.extend(_as_list("truncated"))
+            generated_tokens.extend(_as_list("generated_tokens"))
+            thinking_tokens.extend(_as_list("thinking_tokens"))
+            ptc_code_tokens.extend(_as_list("ptc_code_tokens"))
+            tool_obs_tokens.extend(_as_list("tool_obs_tokens"))
             ptc_counts.extend(_as_list("programmatic_tool_call_count"))
             ptc_error_counts.extend(_as_list("programmatic_tool_call_error_count"))
             ptc_error_penalties.extend(_as_list("ptc_error_penalty"))
@@ -323,14 +332,23 @@ class TaskSyncTrainer(RayPPOTrainer):
             "val/reward/success_rate": (
                 float(np.mean(episode_successes)) if episode_successes else 0.0
             ),
+            "val/reward/claim_done_rate": (
+                float(np.mean(episode_claim_dones)) if episode_claim_dones else 0.0
+            ),
         }
 
         # ---- group_status/* ----
         total_groups = len(uid2rewards)
         all_zero_groups = sum(1 for vals in uid2rewards.values() if all(v == 0 for v in vals))
         all_one_groups = sum(1 for vals in uid2rewards.values() if all(v == 1 for v in vals))
+        zero_std_groups = sum(
+            1
+            for vals in uid2rewards.values()
+            if len(vals) <= 1 or min(vals) == max(vals)
+        )
         all_zero_ratio = all_zero_groups / total_groups if total_groups else 0.0
         all_one_ratio = all_one_groups / total_groups if total_groups else 0.0
+        zero_std_ratio = zero_std_groups / total_groups if total_groups else 0.0
 
         group_metrics = {
             "val/group_status/mean_episode_len": (
@@ -346,6 +364,8 @@ class TaskSyncTrainer(RayPPOTrainer):
             "val/group_status/all_zero_ratio": all_zero_ratio,
             "val/group_status/all_one_groups": all_one_groups,
             "val/group_status/all_one_ratio": all_one_ratio,
+            "val/group_status/zero_std_groups": zero_std_groups,
+            "val/group_status/zero_std_ratio": zero_std_ratio,
             "val/group_status/mean_ptc_count": (
                 float(np.mean(ptc_counts)) if ptc_counts else 0.0
             ),
@@ -360,6 +380,18 @@ class TaskSyncTrainer(RayPPOTrainer):
             ),
             "val/group_status/mean_env_tool_count": (
                 float(np.mean(env_tool_counts)) if env_tool_counts else 0.0
+            ),
+            "val/length/mean_generated_tokens": (
+                float(np.mean(generated_tokens)) if generated_tokens else 0.0
+            ),
+            "val/length/mean_thinking_tokens": (
+                float(np.mean(thinking_tokens)) if thinking_tokens else 0.0
+            ),
+            "val/length/mean_ptc_code_tokens": (
+                float(np.mean(ptc_code_tokens)) if ptc_code_tokens else 0.0
+            ),
+            "val/length/mean_tool_obs_tokens": (
+                float(np.mean(tool_obs_tokens)) if tool_obs_tokens else 0.0
             ),
             "val/reward/mean_ptc_error_penalty": (
                 float(np.mean(ptc_error_penalties)) if ptc_error_penalties else 0.0
@@ -513,14 +545,22 @@ class TaskSyncTrainer(RayPPOTrainer):
                     total_groups = len(prompt_uid2reward_vals)
                     all_zero_groups = 0
                     all_one_groups = 0
+                    zero_std_groups = 0
                     for _uid, reward_vals in prompt_uid2reward_vals.items():
                         if all(v == 0 for v in reward_vals):
                             all_zero_groups += 1
                         elif all(v == 1 for v in reward_vals):
                             all_one_groups += 1
+                        # Any zero-variance group (identical rewards, incl.
+                        # fractional dense scores) gets zero advantage in GRPO
+                        # -- these samples contribute no gradient. Superset of
+                        # all_zero/all_one under dense rewards.
+                        if len(reward_vals) <= 1 or min(reward_vals) == max(reward_vals):
+                            zero_std_groups += 1
 
                     all_zero_ratio = all_zero_groups / total_groups if total_groups else 0.0
                     all_one_ratio = all_one_groups / total_groups if total_groups else 0.0
+                    zero_std_ratio = zero_std_groups / total_groups if total_groups else 0.0
 
                     def _mean_of(key: str) -> float:
                         arr = new_batch.non_tensor_batch.get(key)
@@ -536,11 +576,18 @@ class TaskSyncTrainer(RayPPOTrainer):
                     mean_terminal_count = _mean_of("terminal_count")
                     mean_env_tool_count = _mean_of("env_tool_count")
                     mean_tool_call_parse_error_count = _mean_of("tool_call_parse_error_count")
+                    # Token-budget breakdown of the response region (see
+                    # TaskSyncAgentLoop._build_output for the accounting).
+                    mean_generated_tokens = _mean_of("generated_tokens")
+                    mean_thinking_tokens = _mean_of("thinking_tokens")
+                    mean_ptc_code_tokens = _mean_of("ptc_code_tokens")
+                    mean_tool_obs_tokens = _mean_of("tool_obs_tokens")
 
                     logger.info(
                         f"Group statistics: total={total_groups}, "
                         f"all_zero={all_zero_groups} ({all_zero_ratio:.2%}), "
                         f"all_one={all_one_groups} ({all_one_ratio:.2%}), "
+                        f"zero_std={zero_std_groups} ({zero_std_ratio:.2%}), "
                         f"mean_ptc={mean_ptc_count:.2f}, mean_ptc_err={mean_ptc_error_count:.2f}, "
                         f"mean_ptc_penalty={mean_ptc_error_penalty:.4f}, "
                         f"mean_py={mean_python_count:.2f}, "
@@ -553,12 +600,18 @@ class TaskSyncTrainer(RayPPOTrainer):
                         "group_status/all_zero_ratio": all_zero_ratio,
                         "group_status/all_one_groups": all_one_groups,
                         "group_status/all_one_ratio": all_one_ratio,
+                        "group_status/zero_std_groups": zero_std_groups,
+                        "group_status/zero_std_ratio": zero_std_ratio,
                         "group_status/mean_ptc_count": mean_ptc_count,
                         "group_status/mean_ptc_error_count": mean_ptc_error_count,
                         "group_status/mean_python_count": mean_python_count,
                         "group_status/mean_terminal_count": mean_terminal_count,
                         "group_status/mean_env_tool_count": mean_env_tool_count,
                         "group_status/mean_tool_call_parse_error_count": mean_tool_call_parse_error_count,
+                        "length/mean_generated_tokens": mean_generated_tokens,
+                        "length/mean_thinking_tokens": mean_thinking_tokens,
+                        "length/mean_ptc_code_tokens": mean_ptc_code_tokens,
+                        "length/mean_tool_obs_tokens": mean_tool_obs_tokens,
                         "reward/mean_ptc_error_penalty": mean_ptc_error_penalty,
                     })
 
@@ -788,7 +841,6 @@ class TaskSyncTrainer(RayPPOTrainer):
 
                 progress_bar.update(1)
                 self.global_steps += 1
-                self.step_count += 1
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
@@ -891,6 +943,7 @@ class TaskSyncTrainer(RayPPOTrainer):
         # Extract reward metrics
         episode_rewards, episode_successes, dense_rewards, episode_turns = [], [], [], []
         rollout_lengths, truncated_flags, ptc_counts = [], [], []
+        claim_done_flags = []
 
         if output.non_tensor_batch:
             ntb = output.non_tensor_batch
@@ -898,6 +951,8 @@ class TaskSyncTrainer(RayPPOTrainer):
                 episode_rewards = ntb["episode_reward"].tolist()
             if "episode_success" in ntb:
                 episode_successes = ntb["episode_success"].tolist()
+            if "episode_claim_done" in ntb:
+                claim_done_flags = ntb["episode_claim_done"].tolist()
             if "dense_reward" in ntb:
                 dense_rewards = ntb["dense_reward"].tolist()
             if "episode_turns" in ntb:
@@ -952,6 +1007,11 @@ class TaskSyncTrainer(RayPPOTrainer):
             "reward/success_rate": (
                 float(np.mean(episode_successes)) if episode_successes else 0.0
             ),
+            # Fraction of rollouts that reached claim_done at all (regardless
+            # of score) -- success_rate is conditioned on solving the task.
+            "reward/claim_done_rate": (
+                float(np.mean(claim_done_flags)) if claim_done_flags else 0.0
+            ),
         }
         output.meta_info["planning_stats"] = planning_stats
 
@@ -965,11 +1025,14 @@ class TaskSyncTrainer(RayPPOTrainer):
                 f"mean_ptc={np.mean(ptc_counts) if ptc_counts else 0:.2f}"
             )
 
-        # Dump experience for training rollouts only
+        # Dump experience for training rollouts only. Keyed on global_steps
+        # (restored from the checkpoint on resume) rather than a local step
+        # counter, so dumps continue numbering across resumes instead of
+        # restarting at 0 and overwriting the earlier run's files.
         if (
             not validate
             and self.dump_experience_every > 0
-            and self.step_count % self.dump_experience_every == 0
+            and self.global_steps % self.dump_experience_every == 0
         ):
             self._dump_experience(
                 output=output,
@@ -1196,7 +1259,7 @@ class TaskSyncTrainer(RayPPOTrainer):
 
             dump_path = os.path.join(
                 self.game_state_save_path,
-                f"actor{self.actor_id}_step{self.step_count}.json",
+                f"actor{self.actor_id}_step{self.global_steps}.json",
             )
             with open(dump_path, "w", encoding="utf-8") as f:
                 json.dump(experiences, f, indent=2, default=str, ensure_ascii=False)

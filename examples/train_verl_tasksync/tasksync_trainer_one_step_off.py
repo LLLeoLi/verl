@@ -156,7 +156,6 @@ class TaskSyncOneStepOffTrainer(OneStepOffRayTrainer):
         self.dump_experience_every = int(
             config.actor_rollout_ref.get("dump_experience_every", -1)
         )
-        self.step_count = 0
         self.actor_id = 0
         self.game_state_save_path = os.path.join(
             self.config.trainer.default_local_dir, "game_states"
@@ -488,7 +487,7 @@ class TaskSyncOneStepOffTrainer(OneStepOffRayTrainer):
         if (
             not validate
             and self.dump_experience_every > 0
-            and self.step_count % self.dump_experience_every == 0
+            and self.global_steps % self.dump_experience_every == 0
         ):
             self._dump_experience(
                 output=output,
@@ -906,7 +905,7 @@ class TaskSyncOneStepOffTrainer(OneStepOffRayTrainer):
 
             dump_path = os.path.join(
                 self.game_state_save_path,
-                f"actor{self.actor_id}_step{self.step_count}.json",
+                f"actor{self.actor_id}_step{self.global_steps}.json",
             )
             with open(dump_path, "w", encoding="utf-8") as f:
                 json.dump(experiences, f, indent=2, default=str, ensure_ascii=False)

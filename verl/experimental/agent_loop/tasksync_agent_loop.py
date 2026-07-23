@@ -344,6 +344,11 @@ class TaskSyncAgentData:
         self.dense_reward: float = 0.0
         self.done: bool = False
         self.success: bool = False
+        # claim_done was called (regardless of the score it earned).
+        self.claimed_done: bool = False
+        # Episode was cut by a length budget (response_length / max_model_len),
+        # including the case where a tool observation would not fit.
+        self.truncated: bool = False
 
         self.programmatic_tool_call_count: int = 0
         self.programmatic_tool_call_error_count: int = 0
@@ -351,6 +356,18 @@ class TaskSyncAgentData:
         self.terminal_count: int = 0
         self.env_tool_count: int = 0
         self.tool_call_parse_error_count: int = 0
+
+        # Token-budget breakdown of the response region:
+        #   thinking_tokens : generated tokens inside <think>...</think> (exact,
+        #                     counted via the </think> token id; 0 for models
+        #                     without a think token, e.g. Qwen3-Coder)
+        #   ptc_code_tokens : re-tokenized `code` of programmatic_tool_call
+        #                     calls (approximate; excludes the <tool_call> wrapper)
+        #   tool_obs_tokens : tool observation tokens appended to the context
+        #                     (exact; mask=0 region)
+        self.thinking_tokens: int = 0
+        self.ptc_code_tokens: int = 0
+        self.tool_obs_tokens: int = 0
 
         self.current_tool_calls: list[dict[str, Any]] = []
 
@@ -416,6 +433,18 @@ class TaskSyncAgentLoop(AgentLoopBase):
         self.max_model_len = self.rollout_config.get(
             "max_model_len", self.prompt_length + self.response_length
         )
+
+        # Resolve <think>/</think> token ids for the thinking-token breakdown.
+        # Qwen3 thinking models have them as real tokens; tokenizers without
+        # them (e.g. Qwen3-Coder) resolve to None/unk and the counter stays 0.
+        unk_id = getattr(self.tokenizer, "unk_token_id", None)
+
+        def _tok_id(tok: str) -> Optional[int]:
+            tid = self.tokenizer.convert_tokens_to_ids(tok)
+            return tid if isinstance(tid, int) and tid >= 0 and tid != unk_id else None
+
+        self.think_start_token_id = _tok_id("<think>")
+        self.think_end_token_id = _tok_id("</think>")
 
         logger.info("TaskSyncAgentLoop initialized")
 
@@ -538,12 +567,14 @@ class TaskSyncAgentLoop(AgentLoopBase):
                     state = await self._handle_pending_state(agent_data, sampling_params)
                 elif state == AgentState.GENERATING:
                     if len(agent_data.response_mask) >= self.response_length:
+                        agent_data.truncated = True
                         state = AgentState.TERMINATED
                         continue
                     if tool_call_count >= max_tool_calls:
                         state = AgentState.TERMINATED
                         continue
                     if len(agent_data.prompt_ids) >= self.max_model_len - 1:
+                        agent_data.truncated = True
                         state = AgentState.TERMINATED
                         continue
 
@@ -800,6 +831,19 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         agent_data.prompt_ids += agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
 
+        # Thinking-token accounting: tokens from turn start through </think>.
+        # If the turn was cut before </think> (length truncation), everything
+        # from <think> onward is thinking.
+        if self.think_end_token_id is not None:
+            turn_ids = agent_data.response_ids
+            try:
+                agent_data.thinking_tokens += turn_ids.index(self.think_end_token_id) + 1
+            except ValueError:
+                if self.think_start_token_id is not None and self.think_start_token_id in turn_ids:
+                    agent_data.thinking_tokens += (
+                        len(turn_ids) - turn_ids.index(self.think_start_token_id)
+                    )
+
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
 
@@ -813,14 +857,28 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         agent_data.current_tool_calls = tool_calls
 
         if not tool_calls:
-            # Strict mode (restored from the pre-2026-05-12 behaviour): any
-            # rollout that fails to produce a parseable tool call -- whether
-            # because the model emitted plain text or because the format was
-            # malformed -- terminates immediately. Since claim_done was never
-            # called, agent_data.final_reward stays at 0. parse_errors is
-            # still bumped into a metric so the rate is observable.
             if parse_errors:
+                # The response *attempted* a tool call but the format was
+                # malformed. Surface the parse error back as a tool
+                # observation (the `tool_call_parse_error` branch in
+                # _execute_tool) so the model can correct itself on the next
+                # turn instead of ending the rollout with reward 0. Each retry
+                # still consumes the max_tool_calls / response_length budgets,
+                # so a model that never recovers is bounded like any other
+                # tool loop, and the retry rate stays observable via
+                # tool_call_parse_error_count.
                 agent_data.tool_call_parse_error_count += 1
+                error_msg = (
+                    "Tool call format error:\n"
+                    + "\n".join(parse_errors)
+                    + "\nFix the tool call format and try again."
+                )
+                agent_data.current_tool_calls = [
+                    {"name": "tool_call_parse_error", "arguments": {"_error": error_msg}}
+                ]
+                return AgentState.PROCESSING_TOOL
+            # Plain text with no tool-call attempt: the model stopped calling
+            # tools without claim_done -- terminate (final_reward stays 0).
             return AgentState.TERMINATED
 
         return AgentState.PROCESSING_TOOL
@@ -869,10 +927,12 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         tool_response_ids = await self.apply_chat_template(tool_messages)
 
         if len(agent_data.response_mask) + len(tool_response_ids) >= self.response_length:
+            agent_data.truncated = True
             return AgentState.TERMINATED
 
         agent_data.prompt_ids += tool_response_ids
         agent_data.response_mask += [0] * len(tool_response_ids)
+        agent_data.tool_obs_tokens += len(tool_response_ids)
 
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(tool_response_ids)
@@ -915,6 +975,7 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
 
         if tool_name == "claim_done":
             action = arguments.get("action", "")
+            agent_data.claimed_done = True
             try:
                 self._merge_ptc_db_writes(env)
                 reward, info = env.step(action)
@@ -926,9 +987,13 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                     )
                 dense_reward = max(0.0, min(raw_reward, 1.0))
                 agent_data.dense_reward = dense_reward
-                agent_data.success = True
+                # success == the task was actually solved (full score), NOT
+                # merely "claim_done was called" -- this drives success_rate
+                # and acc. Tolerance absorbs float noise in env scoring.
+                solved = dense_reward >= 1.0 - 1e-6
+                agent_data.success = solved
                 if reward_type == "binary":
-                    reward = 1.0 if dense_reward == 1.0 else 0.0
+                    reward = 1.0 if solved else 0.0
                 else:
                     reward = dense_reward
                 observation = json.dumps(info, ensure_ascii=False, default=str)
@@ -949,6 +1014,14 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         if tool_name == "programmatic_tool_call":
             code = arguments.get("code", "")
             agent_data.programmatic_tool_call_count += 1
+            # Approximate PTC token spend: re-tokenize the code payload (the
+            # <tool_call> wrapper and parameter tags are not included).
+            try:
+                agent_data.ptc_code_tokens += len(
+                    self.tokenizer.encode(code, add_special_tokens=False)
+                )
+            except Exception:
+                pass
             ptc_sandbox = env.ptc_sandbox
             if ptc_sandbox is None:
                 agent_data.programmatic_tool_call_error_count += 1
@@ -1254,6 +1327,17 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         rollout_length = len(prompt_ids) + len(response_ids)
 
         if len(prompt_ids) > self.prompt_length:
+            # Left-truncating the prompt makes training condition on a shorter
+            # context than the rollout actually saw -- every response logprob
+            # is then biased. Loud warning so oversized task prompts get fixed
+            # at the source (prompt.md / tool schemas) instead of silently
+            # corrupting the batch.
+            logger.warning(
+                f"task '{agent_data.env.task_name}': initial prompt "
+                f"({len(prompt_ids)} tokens) exceeds prompt_length "
+                f"({self.prompt_length}); left-truncating -- training/rollout "
+                f"context mismatch for this sample."
+            )
             prompt_ids = prompt_ids[-self.prompt_length :]
 
         response_ids = response_ids[: self.response_length]
@@ -1265,15 +1349,19 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         )
 
         is_truncated = (
-            len(agent_data.response_mask) >= self.response_length
+            agent_data.truncated
+            or len(agent_data.response_mask) >= self.response_length
             or rollout_length >= self.max_model_len
         )
 
         ptc_error_count = agent_data.programmatic_tool_call_error_count
-        ptc_error_penalty = self.ptc_error_penalty * ptc_error_count
+        requested_penalty = self.ptc_error_penalty * ptc_error_count
         # Clip to >= 0 so the penalty can never make a non-negative reward
         # turn negative (avoids GRPO advantage flips driven purely by errors).
-        penalized_reward = max(float(agent_data.final_reward) - ptc_error_penalty, 0.0)
+        penalized_reward = max(float(agent_data.final_reward) - requested_penalty, 0.0)
+        # Report the penalty actually applied (post-clip), not the requested
+        # one, so reward/mean_ptc_error_penalty reflects real reward impact.
+        ptc_error_penalty = float(agent_data.final_reward) - penalized_reward
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -1300,9 +1388,17 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             "episode_reward_raw": agent_data.final_reward,
             "dense_reward": agent_data.dense_reward,
             "episode_success": agent_data.success,
+            "episode_claim_done": agent_data.claimed_done,
             "acc": float(agent_data.success),
             "episode_turns": agent_data.assistant_turns,
             "rollout_length": rollout_length,
+            # Token-budget breakdown (all pre-truncation, like rollout_length):
+            # generated_tokens ~= thinking + ptc_code + prose/other tool calls;
+            # rollout_length ~= prompt + generated_tokens + tool_obs_tokens.
+            "generated_tokens": int(sum(agent_data.response_mask)),
+            "thinking_tokens": agent_data.thinking_tokens,
+            "ptc_code_tokens": agent_data.ptc_code_tokens,
+            "tool_obs_tokens": agent_data.tool_obs_tokens,
             "truncated": is_truncated,
             "programmatic_tool_call_count": agent_data.programmatic_tool_call_count,
             "programmatic_tool_call_error_count": ptc_error_count,
@@ -1338,9 +1434,14 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                     "episode_reward_raw": 0.0,
                     "dense_reward": 0.0,
                     "episode_success": False,
+                    "episode_claim_done": False,
                     "acc": 0.0,
                     "episode_turns": 0,
                     "rollout_length": 0,
+                    "generated_tokens": 0,
+                    "thinking_tokens": 0,
+                    "ptc_code_tokens": 0,
+                    "tool_obs_tokens": 0,
                     "truncated": False,
                     "programmatic_tool_call_count": 0,
                     "programmatic_tool_call_error_count": 0,
