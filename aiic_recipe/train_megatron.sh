@@ -14,6 +14,14 @@ set -x
 # Ease multi-epoch CUDA-allocator fragmentation.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# MoE (Qwen3-Coder-30B-A3B): force the Triton unquantized-MoE backend. vLLM 0.20
+# defaults to FlashInfer TRTLLM/CUTLASS, whose post-load weight shuffle is
+# non-idempotent — verl re-runs process_weights_after_loading on every weight
+# sync, which first crashes ("Current vLLM config is not set") and, if worked
+# around, corrupts rollout weights (garbled generations). Must be explicitly 0:
+# unset keeps FlashInfer in the candidate list. Cf. verl issue #6563.
+export VLLM_USE_FLASHINFER_MOE_FP16=0
+
 # Resolve repo root from the script location so this runs from anywhere.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -36,6 +44,7 @@ while [[ "$#" -gt 0 ]]; do
         --env_group_size) env_group_size="$2"; shift 2 ;;
         --max_num_batched_tokens) max_num_batched_tokens="$2"; shift 2 ;;
         --temperature) temperature="$2"; shift 2 ;;
+        --clip_ratio_low) clip_ratio_low="$2"; shift 2 ;;
         --clip_ratio_high) clip_ratio_high="$2"; shift 2 ;;
         --total_epochs) total_epochs="$2"; shift 2 ;;
         --loss_mode) loss_mode="$2"; shift 2 ;;
@@ -43,6 +52,8 @@ while [[ "$#" -gt 0 ]]; do
         --lr_warmup_steps) lr_warmup_steps="$2"; shift 2 ;;
         --weight_decay) weight_decay="$2"; shift 2 ;;
         --rollout_tp) rollout_tp="$2"; shift 2 ;;
+        --rollout_ep) rollout_ep="$2"; shift 2 ;;
+        --free_cache_engine) free_cache_engine="$2"; shift 2 ;;
         --actor_tp) actor_tp="$2"; shift 2 ;;
         --actor_pp) actor_pp="$2"; shift 2 ;;
         --actor_cp) actor_cp="$2"; shift 2 ;;
@@ -99,7 +110,11 @@ env_group_size=${env_group_size:-32}
 ppo_mini_bsz=$((env_batch_size * env_group_size))
 
 temperature=${temperature:-1.0}
-clip_ratio_high=${clip_ratio_high:-0.28}
+# GSPO clips the *sequence-level* importance ratio, which hovers near 1, so the
+# clip range must be far tighter than token-level PPO/DAPO values (0.2/0.28
+# would effectively never trigger). Defaults follow the GSPO paper (3e-4/4e-4).
+clip_ratio_low=${clip_ratio_low:-1e-2}
+clip_ratio_high=${clip_ratio_high:-2e-2}
 total_epochs=${total_epochs:-5}
 loss_mode=${loss_mode:-gspo}
 actor_lr=${actor_lr:-1e-6}
@@ -109,9 +124,14 @@ weight_decay=${weight_decay:-0.1}
 # ==============================================================================
 # Parallelism
 # ==============================================================================
-rollout_tp=${rollout_tp:-2}
+rollout_tp=${rollout_tp:-8}
+# vLLM expert parallelism for rollout. Default 1 (EP disabled, TP-only sharding):
+# EP>1 combined with sleep/wake and per-tensor weight sync has produced garbled
+# rollouts for MoE (cf. vllm issue #25171). Pass --rollout_ep ${rollout_tp} to
+# re-enable once the weight-sync path is validated.
+rollout_ep=${rollout_ep:-1}
 actor_tp=${actor_tp:-2}
-actor_pp=${actor_pp:-2}
+actor_pp=${actor_pp:-1}
 actor_cp=${actor_cp:-2}
 actor_ep=${actor_ep:-8}
 actor_etp=${actor_etp:-1}
@@ -129,6 +149,9 @@ max_token_len_per_gpu=${max_token_len_per_gpu:-$(( (total_len + actor_cp - 1) / 
 # Offload & misc
 # ==============================================================================
 offload=${offload:-True}
+# vLLM sleep/wake between rollouts. Decoupled from megatron offload so either
+# can be toggled independently (e.g. to isolate MoE weight corruption on wake).
+free_cache_engine=${free_cache_engine:-${offload}}
 offload_fraction=${offload_fraction:-1.0}
 use_mbridge=${use_mbridge:-True}
 gpu_memory_utilization=${gpu_memory_utilization:-0.8}
@@ -206,19 +229,21 @@ TRAIN_CMD=(
     actor_rollout_ref.rollout.response_length=${response_len}
     actor_rollout_ref.rollout.max_model_len=${total_len}
     actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp}
+    actor_rollout_ref.rollout.expert_parallel_size=${rollout_ep}
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization}
     actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens}
     actor_rollout_ref.rollout.agent.default_agent_loop=${agent_loop}
     actor_rollout_ref.rollout.agent.num_workers=${num_workers}
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${max_token_len_per_gpu}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
-    actor_rollout_ref.rollout.free_cache_engine=${offload}
+    actor_rollout_ref.rollout.free_cache_engine=${free_cache_engine}
     actor_rollout_ref.dump_experience_every=${dump_experience_every}
 
     # actor training
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_bsz}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${max_token_len_per_gpu}
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low}
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high}
     actor_rollout_ref.actor.policy_loss.loss_mode="${loss_mode}"
     actor_rollout_ref.actor.entropy_coeff=0
@@ -248,11 +273,14 @@ TRAIN_CMD=(
     +actor_rollout_ref.actor.megatron.override_transformer_config.persist_layer_norm=True
 
     # actor megatron MoE config
+    # mbridge (use_mbridge=True) only maps grouped-GEMM expert weight names
+    # (mlp.experts.linear_fc1.weightN); SequentialMLP's local_experts.N.* names
+    # raise NotImplementedError at load_weights. Keep True whenever mbridge loads.
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True
+    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=False
     "+actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=flex"
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_enable_deepep=True
+    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_enable_deepep=False
 
     # actor optimizer
     actor_rollout_ref.actor.optim.lr=${actor_lr}

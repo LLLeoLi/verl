@@ -42,6 +42,12 @@ export MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 export MASTER_PORT=${MASTER_PORT:-6379}
 export RAY_TIMEOUT=${RAY_TIMEOUT:-1000}
 export VLLM_USE_V1=${VLLM_USE_V1:-1}
+# MoE: force Triton unquantized-MoE backend (vLLM 0.20 defaults to FlashInfer,
+# whose non-idempotent post-load weight shuffle breaks verl's per-step weight
+# sync: "Current vLLM config is not set" crash / garbled rollouts). Must reach
+# the vLLM server actors on EVERY node, hence also in RUNTIME_ENV_JSON below —
+# an export inside train_megatron.sh only affects the head-node driver process.
+export VLLM_USE_FLASHINFER_MOE_FP16=${VLLM_USE_FLASHINFER_MOE_FP16:-0}
 
 # JD's MASTER_ADDR is a StatefulSet DNS hostname (e.g.
 # pt-<id>-master-0.pt-<id>), NOT an IP. The colleague's working torchrun job
@@ -119,6 +125,7 @@ else
             \"NGPUS_PER_NODE\": \"$NGPUS_PER_NODE\",
             \"WANDB_API_KEY\": \"${WANDB_API_KEY:-}\",
             \"VLLM_USE_V1\": \"$VLLM_USE_V1\",
+            \"VLLM_USE_FLASHINFER_MOE_FP16\": \"$VLLM_USE_FLASHINFER_MOE_FP16\",
             \"TORCH_CUDA_ARCH_LIST\": \"${TORCH_CUDA_ARCH_LIST:-9.0+PTX}\",
             \"PYTHONNOUSERSITE\": \"1\",
             \"RAY_DEDUP_LOGS\": \"0\",

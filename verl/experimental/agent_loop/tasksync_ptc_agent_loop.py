@@ -174,6 +174,9 @@ class TaskSyncEnvState:
     ptc_sandbox: Optional[Any] = field(default=None, init=False)
     terminal_executor: Optional[Any] = field(default=None, init=False)
     ptc_db_path: Optional[str] = field(default=None, init=False)
+    # Set when the PTC kernel died unrecoverably and was torn down; the next
+    # programmatic_tool_call lazily starts a fresh kernel (state lost).
+    ptc_restart_pending: bool = field(default=False, init=False)
 
     current_num_calls: int = field(default=0, init=False)
     is_done: bool = field(default=False, init=False)
@@ -290,9 +293,15 @@ class TaskSyncAgentData:
         self.dense_reward: float = 0.0
         self.done: bool = False
         self.success: bool = False
+        # claim_done was called (regardless of the score it earned).
+        self.claimed_done: bool = False
+        self.tool_call_parse_error_count: int = 0
 
         self.programmatic_tool_call_count: int = 0
         self.programmatic_tool_call_error_count: int = 0
+        # Fresh PTC kernels started after an unrecoverable kernel death
+        # (bounded per-episode by env.ptc_max_restarts).
+        self.ptc_sandbox_restart_count: int = 0
         self.terminal_count: int = 0
 
         self.current_tool_calls: list[dict[str, Any]] = []
@@ -314,6 +323,12 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
         # Per-execute() timeout of the PTC sandbox kernel. Default matches the
         # previously hardcoded value so existing runs keep their behavior.
         self.ptc_timeout = float(env_cfg.get("ptc_timeout", 10.0))
+        # Max fresh kernels started per episode after an unrecoverable PTC
+        # kernel death (hard-killed timeout, crash, OOM). Especially important
+        # in this PTC-only loop: a dead kernel would otherwise leave the model
+        # with no way to interact with the env at all. 0 disables restarts
+        # (pre-existing fail-dead behavior).
+        self.ptc_max_restarts = int(env_cfg.get("ptc_max_restarts", 3))
         self.data_py_timeout = env_cfg.get("data_py_timeout", 120)
 
         self.ptc_desc = env_cfg.get("ptc_desc", "rich")
@@ -483,8 +498,16 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
                 # so its memory -- and the env module namespace its tools pin --
                 # is reclaimed by refcounting instead of leaking until a cyclic
                 # GC pass. See landlock_sandbox.teardown_env.
+                #
+                # Capture the live PTC kernel first: teardown_env() nulls
+                # env.ptc_sandbox, and after a mid-episode PTC restart the
+                # local `ptc_sandbox` still points at the dead original (whose
+                # cleanup() is idempotent), so clean up both when they differ.
+                env_ptc_sandbox = env.ptc_sandbox if env is not None else None
                 teardown_env(env)
                 cleanup_futures = []
+                if env_ptc_sandbox is not None and env_ptc_sandbox is not ptc_sandbox:
+                    cleanup_futures.append(self.loop.run_in_executor(None, env_ptc_sandbox.cleanup))
                 if ptc_sandbox is not None:
                     cleanup_futures.append(self.loop.run_in_executor(None, ptc_sandbox.cleanup))
                 if env_dir:
@@ -596,11 +619,16 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
         # Copy data.db into the writable workspace so write-tools can INSERT.
         # See tasksync_agent_loop._setup_ptc_sandbox_tools for rationale.
         ptc_db_path = os.path.join(env.workspace, ".ptc_data.db")
-        try:
-            shutil.copy2(env.db_path, ptc_db_path)
-        except OSError as e:
-            logger.warning(f"Failed to copy data.db for PTC sandbox: {e}")
-            ptc_db_path = env.db_path
+        if env.ptc_db_path == ptc_db_path and os.path.exists(ptc_db_path):
+            # Kernel restart: reuse the existing copy so tables the agent
+            # already wrote (merged back at claim_done) survive the restart.
+            pass
+        else:
+            try:
+                shutil.copy2(env.db_path, ptc_db_path)
+            except OSError as e:
+                logger.warning(f"Failed to copy data.db for PTC sandbox: {e}")
+                ptc_db_path = env.db_path
         env.ptc_db_path = ptc_db_path
 
         setup_code = textwrap.dedent(f"""\
@@ -620,6 +648,40 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         if not success:
             return {"success": False, "error": result}
         return {"success": True, "output": result}
+
+    async def _restart_ptc_sandbox(
+        self, env: TaskSyncEnvState
+    ) -> tuple[Optional[StatefulSandbox], Optional[str]]:
+        """Start a fresh PTC kernel after an unrecoverable kernel death.
+
+        Mirrors the bring-up in run(): gated by sandbox_startup_gate() so a
+        wave of restarts (e.g. after a node-memory kernel sweep) cannot
+        stampede the node, and blocking steps run in the executor. The DB copy
+        in the workspace is reused (see _setup_ptc_sandbox_tools), so agent
+        writes survive; kernel state (variables, imports) does not.
+
+        Returns (sandbox, None) on success, (None, error_message) on failure.
+        """
+        async with sandbox_startup_gate():
+            sandbox = StatefulSandbox(
+                workspace_path=env.workspace,
+                timeout=self.ptc_timeout,
+                extra_read_paths=[env.env_dir],
+            )
+            try:
+                await self.loop.run_in_executor(None, sandbox.start)
+            except Exception as e:
+                logger.error(f"PTC sandbox restart failed to start for task {env.task_name}: {e}")
+                return None, str(e)
+            setup_result = await self.loop.run_in_executor(
+                None, self._setup_ptc_sandbox_tools, sandbox, env
+            )
+            if not setup_result.get("success"):
+                error_msg = setup_result.get("error", "Unknown error")
+                logger.error(f"PTC sandbox restart setup failed for task {env.task_name}: {error_msg}")
+                await self.loop.run_in_executor(None, sandbox.cleanup)
+                return None, error_msg
+        return sandbox, None
 
     @staticmethod
     def _merge_ptc_db_writes(env: TaskSyncEnvState) -> None:
@@ -701,10 +763,32 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
 
         agent_data.messages.append({"role": "assistant", "content": response_text})
 
-        tool_calls = self._parse_tool_calls(response_text)
+        tool_calls, parse_errors = self._parse_tool_calls(response_text)
         agent_data.current_tool_calls = tool_calls
 
         if not tool_calls:
+            if parse_errors:
+                # The response *attempted* a tool call but the format was
+                # malformed. Surface the parse error back as a tool
+                # observation (the `tool_call_parse_error` branch in
+                # _execute_tool) so the model can correct itself on the next
+                # turn instead of ending the rollout with reward 0. Each retry
+                # still consumes the max_tool_calls / response_length budgets,
+                # so a model that never recovers is bounded like any other
+                # tool loop, and the retry rate stays observable via
+                # tool_call_parse_error_count.
+                agent_data.tool_call_parse_error_count += 1
+                error_msg = (
+                    "Tool call format error:\n"
+                    + "\n".join(parse_errors)
+                    + "\nFix the tool call format and try again."
+                )
+                agent_data.current_tool_calls = [
+                    {"name": "tool_call_parse_error", "arguments": {"_error": error_msg}}
+                ]
+                return AgentState.PROCESSING_TOOL
+            # Plain text with no tool-call attempt: the model stopped calling
+            # tools without claim_done -- terminate (final_reward stays 0).
             return AgentState.TERMINATED
 
         return AgentState.PROCESSING_TOOL
@@ -791,8 +875,17 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         loop = self.loop
         tool_executor = get_tool_executor()
 
+        if tool_name == "tool_call_parse_error":
+            # Synthesised by _handle_generating_state when the model emitted a
+            # malformed tool call. Surface the parse error back as a tool
+            # observation so the model can self-correct on the next turn,
+            # instead of terminating with reward 0. Deliberately NOT counted as
+            # a programmatic_tool_call_error (no PTC was attempted).
+            return arguments.get("_error", "Tool call could not be parsed."), 0.0, False
+
         if tool_name == "claim_done":
             action = arguments.get("action", "")
+            agent_data.claimed_done = True
             try:
                 self._merge_ptc_db_writes(env)
                 reward, info = env.step(action)
@@ -804,9 +897,13 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                     )
                 dense_reward = max(0.0, min(raw_reward, 1.0))
                 agent_data.dense_reward = dense_reward
-                agent_data.success = True
+                # success == the task was actually solved (full score), NOT
+                # merely "claim_done was called" -- this drives success_rate
+                # and acc. Tolerance absorbs float noise in env scoring.
+                solved = dense_reward >= 1.0 - 1e-6
+                agent_data.success = solved
                 if reward_type == "binary":
-                    reward = 1.0 if dense_reward == 1.0 else 0.0
+                    reward = 1.0 if solved else 0.0
                 else:
                     reward = dense_reward
                 observation = json.dumps(info, ensure_ascii=False, default=str)
@@ -819,12 +916,64 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             code = arguments.get("code", "")
             agent_data.programmatic_tool_call_count += 1
             ptc_sandbox = env.ptc_sandbox
+            if ptc_sandbox is None and env.ptc_restart_pending:
+                # A previous call left the kernel unrecoverably dead; start a
+                # fresh one now (lazy, so a rollout that never calls PTC again
+                # pays no bring-up cost).
+                if agent_data.ptc_sandbox_restart_count >= self.ptc_max_restarts:
+                    agent_data.programmatic_tool_call_error_count += 1
+                    return (
+                        "[Error] The Python sandbox died and the restart limit for this "
+                        "task is exhausted; programmatic_tool_call (and with it the env "
+                        "tools) is no longer available. Use terminal to inspect files and "
+                        "claim_done when ready."
+                    ), 0.0, False
+                agent_data.ptc_sandbox_restart_count += 1
+                ptc_sandbox, restart_err = await self._restart_ptc_sandbox(env)
+                if ptc_sandbox is None:
+                    agent_data.programmatic_tool_call_error_count += 1
+                    return (
+                        f"[Error] Failed to restart the Python sandbox: {restart_err}\n"
+                        "Another restart will be attempted on your next programmatic_tool_call."
+                    ), 0.0, False
+                env.ptc_sandbox = ptc_sandbox
+                env.ptc_restart_pending = False
             if ptc_sandbox is None:
                 agent_data.programmatic_tool_call_error_count += 1
                 return "Error: PTC sandbox not initialized", 0.0, False
             result, success = await loop.run_in_executor(tool_executor, ptc_sandbox.execute, code)
             if not success:
                 agent_data.programmatic_tool_call_error_count += 1
+                if getattr(ptc_sandbox, "_dead", False):
+                    # Unrecoverable death (hard-killed timeout, kernel crash /
+                    # OOM): tear the kernel down so the next call starts a
+                    # fresh one instead of failing for the rest of the task.
+                    # Kernel state is lost; rewrite the (now stale) "subsequent
+                    # code will not run" message and tell the model explicitly.
+                    env.ptc_sandbox = None
+                    env.ptc_restart_pending = True
+                    await loop.run_in_executor(tool_executor, ptc_sandbox.cleanup)
+                    result = result.replace(
+                        "Sandbox killed; subsequent code will not run.",
+                        "Sandbox killed.",
+                    ).replace(
+                        "(killed after a previous timeout / crash). Subsequent code will not run.",
+                        "(killed after a previous timeout / crash).",
+                    )
+                    if agent_data.ptc_sandbox_restart_count < self.ptc_max_restarts:
+                        result += (
+                            "\n\n[note] The Python sandbox was killed and a fresh one will "
+                            "be started automatically on your next programmatic_tool_call. "
+                            "All variables, imports and function definitions are lost -- "
+                            "re-create any state you still need."
+                        )
+                    else:
+                        result += (
+                            "\n\n[note] The Python sandbox was killed and the restart limit "
+                            "for this task is exhausted; programmatic_tool_call (and with "
+                            "it the env tools) is no longer available. Use terminal to "
+                            "inspect files and claim_done when ready."
+                        )
             return result, 0.0, False
 
         if tool_name == "terminal":
@@ -866,12 +1015,28 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             False,
         )
 
-    def _parse_tool_calls(self, response: str) -> list[dict[str, Any]]:
+    def _parse_tool_calls(self, response: str) -> tuple[list[dict[str, Any]], list[str]]:
+        """Parse all tool calls in the response.
+
+        Returns (calls, errors). ``errors`` is non-empty when the response
+        *attempted* a tool call (had <tool_call> / a JSON object with a "name"
+        key) but parsing failed somewhere. Callers use this signal to surface
+        the error back to the model instead of silently terminating the
+        rollout with reward 0. See tasksync_agent_loop._parse_tool_calls.
+        """
         calls: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        # Ignore anything emitted inside the model's reasoning block. Qwen3
+        # thinking models sometimes leak a <tool_call> into <think>...</think>;
+        # only the post-reasoning answer should drive tool execution.
+        think_close = "</think>"
+        think_end = response.rfind(think_close)
+        if think_end != -1:
+            response = response[think_end + len(think_close) :]
 
         # XML-style: strict format -- requires <tool_call>...</tool_call> wrapper,
-        # with a properly closed <function=NAME>...</function> inside. Malformed
-        # blocks are dropped entirely.
+        # with a properly closed <function=NAME>...</function> inside.
         open_tag = "<tool_call>"
         close_tag = "</tool_call>"
         if open_tag in response:
@@ -882,14 +1047,16 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                     break
                 end = response.find(close_tag, start + len(open_tag))
                 if end == -1:
-                    logger.warning("Unclosed <tool_call> wrapper; dropping call")
+                    msg = "Unclosed <tool_call> wrapper (missing </tool_call>)"
+                    logger.warning(msg + "; dropping call")
+                    errors.append(msg)
                     break
                 inner = response[start + len(open_tag) : end]
-                parsed = self._parse_tool_call(inner)
+                parsed = self._parse_tool_call(inner, errors)
                 if parsed is not None:
                     calls.append(parsed)
                 idx = end + len(close_tag)
-            return calls
+            return calls, errors
 
         # JSON-style: scan for all top-level {...} blocks containing a "name" field.
         pos = 0
@@ -899,28 +1066,42 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                 break
             end = self._find_balanced_brace(response, start)
             if end == -1:
+                if '"name"' in response[start:]:
+                    errors.append(
+                        "Unbalanced braces in JSON tool call (could not find matching '}')."
+                    )
                 break
             blob = response[start : end + 1]
             parsed: Optional[dict[str, Any]] = None
             if '"name"' in blob:
                 try:
                     tc = json.loads(blob)
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError) as e:
                     tc = None
+                    errors.append(
+                        f"JSON tool call failed to parse: {e}. "
+                        f"Snippet: {blob[:200].replace(chr(10), ' ')}"
+                    )
                 if isinstance(tc, dict) and "name" in tc:
                     args = tc.get("arguments", {})
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
-                        except (json.JSONDecodeError, ValueError):
+                        except (json.JSONDecodeError, ValueError) as e:
+                            errors.append(
+                                f"'arguments' for tool '{tc['name']}' was a string but "
+                                f"not valid JSON: {e}"
+                            )
                             args = {}
                     parsed = {"name": tc["name"], "arguments": args}
+                elif isinstance(tc, dict):
+                    errors.append("JSON tool call missing required 'name' field.")
             if parsed is not None:
                 calls.append(parsed)
                 pos = end + 1
             else:
                 pos = start + 1
-        return calls
+        return calls, errors
 
     @staticmethod
     def _find_balanced_brace(s: str, start: int) -> int:
@@ -948,31 +1129,41 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                     return j
         return -1
 
-    def _parse_tool_call(self, block: str) -> Optional[dict[str, Any]]:
+    def _parse_tool_call(self, block: str, errors: list[str]) -> Optional[dict[str, Any]]:
         """Parse a single tool call from the contents of a <tool_call>...</tool_call>
         block. Requires <function=NAME>...</function> to be properly closed, and
         each <parameter=NAME>...</parameter> to be properly closed. Returns None
-        (dropping the entire call) on any malformed structure."""
+        (dropping the entire call) on any malformed structure, appending a
+        descriptive message to ``errors`` so the caller can surface it to the
+        model."""
         try:
             func_start = block.find("<function=")
             if func_start == -1:
-                logger.warning("Tool call missing <function=...>; dropping")
+                msg = "Tool call missing <function=...> tag."
+                logger.warning(msg + " Dropping.")
+                errors.append(msg)
                 return None
 
             func_part = block[func_start + len("<function=") :]
             name_end = func_part.find(">")
             if name_end == -1:
-                logger.warning("Malformed <function=...> tag; dropping")
+                msg = "Malformed <function=...> tag (missing '>')."
+                logger.warning(msg + " Dropping.")
+                errors.append(msg)
                 return None
             func_name = func_part[:name_end].strip()
             if not func_name:
-                logger.warning("Empty function name; dropping")
+                msg = "Empty function name in <function=...> tag."
+                logger.warning(msg + " Dropping.")
+                errors.append(msg)
                 return None
 
             remaining = func_part[name_end + 1 :]
             close_idx = remaining.find("</function>")
             if close_idx == -1:
-                logger.warning(f"Tool call '{func_name}' missing </function>; dropping")
+                msg = f"Tool call '{func_name}' missing </function> closing tag."
+                logger.warning(msg + " Dropping.")
+                errors.append(msg)
                 return None
             params_block = remaining[:close_idx]
 
@@ -982,21 +1173,25 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                 for param in params[1:]:
                     pname_end = param.find(">")
                     if pname_end == -1:
-                        logger.warning(
-                            f"Malformed <parameter=...> in '{func_name}'; dropping call"
-                        )
+                        msg = f"Malformed <parameter=...> tag in '{func_name}' (missing '>')."
+                        logger.warning(msg + " Dropping call.")
+                        errors.append(msg)
                         return None
                     param_name = param[:pname_end].strip()
                     if not param_name:
-                        logger.warning(f"Empty parameter name in '{func_name}'; dropping call")
+                        msg = f"Empty parameter name in '{func_name}'."
+                        logger.warning(msg + " Dropping call.")
+                        errors.append(msg)
                         return None
                     after = param[pname_end + 1 :]
                     pclose_idx = after.find("</parameter>")
                     if pclose_idx == -1:
-                        logger.warning(
+                        msg = (
                             f"Parameter '{param_name}' in '{func_name}' missing "
-                            f"</parameter>; dropping call"
+                            f"</parameter> closing tag."
                         )
+                        logger.warning(msg + " Dropping call.")
+                        errors.append(msg)
                         return None
                     param_value_raw = after[:pclose_idx].strip()
                     arguments[param_name] = self._parse_param_value(param_value_raw)
@@ -1004,6 +1199,7 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             return {"name": func_name, "arguments": arguments}
         except Exception as e:
             logger.warning(f"Error parsing tool call: {e}")
+            errors.append(f"Error parsing tool call: {e}")
             return None
 
     def _parse_param_value(self, param_value_raw: str) -> Any:
@@ -1082,13 +1278,16 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             "episode_reward_raw": agent_data.final_reward,
             "dense_reward": agent_data.dense_reward,
             "episode_success": agent_data.success,
+            "episode_claim_done": agent_data.claimed_done,
             "acc": float(agent_data.success),
             "episode_turns": agent_data.assistant_turns,
             "rollout_length": rollout_length,
             "truncated": is_truncated,
             "programmatic_tool_call_count": agent_data.programmatic_tool_call_count,
             "programmatic_tool_call_error_count": ptc_error_count,
+            "ptc_sandbox_restart_count": agent_data.ptc_sandbox_restart_count,
             "ptc_error_penalty": ptc_error_penalty,
+            "tool_call_parse_error_count": agent_data.tool_call_parse_error_count,
             # Kept for trainer-side metric aggregation parity with tasksync_agent.
             "execute_python_count": 0,
             "terminal_count": agent_data.terminal_count,
@@ -1118,13 +1317,16 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                     "episode_reward_raw": 0.0,
                     "dense_reward": 0.0,
                     "episode_success": False,
+                    "episode_claim_done": False,
                     "acc": 0.0,
                     "episode_turns": 0,
                     "rollout_length": 0,
                     "truncated": False,
                     "programmatic_tool_call_count": 0,
                     "programmatic_tool_call_error_count": 0,
+                    "ptc_sandbox_restart_count": 0,
                     "ptc_error_penalty": 0.0,
+                    "tool_call_parse_error_count": 0,
                     "execute_python_count": 0,
                     "terminal_count": 0,
                     "env_tool_count": 0,
