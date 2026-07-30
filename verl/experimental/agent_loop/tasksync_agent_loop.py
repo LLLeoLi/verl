@@ -180,9 +180,6 @@ class TaskSyncEnvState:
     ptc_sandbox: Optional[Any] = field(default=None, init=False)
     terminal_executor: Optional[Any] = field(default=None, init=False)
     ptc_db_path: Optional[str] = field(default=None, init=False)
-    # Set when the PTC kernel died unrecoverably and was torn down; the next
-    # programmatic_tool_call lazily starts a fresh kernel (state lost).
-    ptc_restart_pending: bool = field(default=False, init=False)
 
     current_num_calls: int = field(default=0, init=False)
     is_done: bool = field(default=False, init=False)
@@ -353,9 +350,6 @@ class TaskSyncAgentData:
 
         self.programmatic_tool_call_count: int = 0
         self.programmatic_tool_call_error_count: int = 0
-        # Fresh PTC kernels started after an unrecoverable kernel death
-        # (bounded per-episode by env.ptc_max_restarts).
-        self.ptc_sandbox_restart_count: int = 0
         self.execute_python_count: int = 0
         self.terminal_count: int = 0
         self.env_tool_count: int = 0
@@ -392,12 +386,6 @@ class TaskSyncAgentLoop(AgentLoopBase):
         # Per-execute() timeout of the PTC sandbox kernel. Default matches the
         # previously hardcoded value so existing runs keep their behavior.
         self.ptc_timeout = float(env_cfg.get("ptc_timeout", 10.0))
-        # Max fresh kernels started per episode after an unrecoverable PTC
-        # kernel death (hard-killed timeout, crash, OOM). Bounded so a kernel
-        # that dies on every bring-up (e.g. env.py import crash, node memory
-        # pressure) cannot stall the startup gate with endless restarts.
-        # 0 disables restarts (pre-existing fail-dead behavior).
-        self.ptc_max_restarts = int(env_cfg.get("ptc_max_restarts", 3))
         self.data_py_timeout = env_cfg.get("data_py_timeout", 120)
 
         # ptc_mode controls whether the programmatic_tool_call tool is exposed.
@@ -629,16 +617,8 @@ class TaskSyncAgentLoop(AgentLoopBase):
                 # so its memory -- and the env module namespace its tools pin --
                 # is reclaimed by refcounting instead of leaking until a cyclic
                 # GC pass. See landlock_sandbox.teardown_env.
-                #
-                # Capture the live PTC kernel first: teardown_env() nulls
-                # env.ptc_sandbox, and after a mid-episode PTC restart the
-                # local `ptc_sandbox` still points at the dead original (whose
-                # cleanup() is idempotent), so clean up both when they differ.
-                env_ptc_sandbox = env.ptc_sandbox if env is not None else None
                 teardown_env(env)
                 cleanup_futures = []
-                if env_ptc_sandbox is not None and env_ptc_sandbox is not ptc_sandbox:
-                    cleanup_futures.append(self.loop.run_in_executor(None, env_ptc_sandbox.cleanup))
                 if ptc_sandbox is not None:
                     cleanup_futures.append(self.loop.run_in_executor(None, ptc_sandbox.cleanup))
                 if sandbox is not None:
@@ -763,16 +743,11 @@ class TaskSyncAgentLoop(AgentLoopBase):
         # reading ground-truth answers, but that also blocks legitimate DB
         # writes.  The workspace overlay is always writable.
         ptc_db_path = os.path.join(env.workspace, ".ptc_data.db")
-        if env.ptc_db_path == ptc_db_path and os.path.exists(ptc_db_path):
-            # Kernel restart: reuse the existing copy so tables the agent
-            # already wrote (merged back at claim_done) survive the restart.
-            pass
-        else:
-            try:
-                shutil.copy2(env.db_path, ptc_db_path)
-            except OSError as e:
-                logger.warning(f"Failed to copy data.db for PTC sandbox: {e}")
-                ptc_db_path = env.db_path  # fall back to original (read-only)
+        try:
+            shutil.copy2(env.db_path, ptc_db_path)
+        except OSError as e:
+            logger.warning(f"Failed to copy data.db for PTC sandbox: {e}")
+            ptc_db_path = env.db_path  # fall back to original (read-only)
         env.ptc_db_path = ptc_db_path
 
         setup_code = textwrap.dedent(f"""\
@@ -792,40 +767,6 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         if not success:
             return {"success": False, "error": result}
         return {"success": True, "output": result}
-
-    async def _restart_ptc_sandbox(
-        self, env: TaskSyncEnvState
-    ) -> tuple[Optional[StatefulSandbox], Optional[str]]:
-        """Start a fresh PTC kernel after an unrecoverable kernel death.
-
-        Mirrors the bring-up in run(): gated by sandbox_startup_gate() so a
-        wave of restarts (e.g. after a node-memory kernel sweep) cannot
-        stampede the node, and blocking steps run in the executor. The DB copy
-        in the workspace is reused (see _setup_ptc_sandbox_tools), so agent
-        writes survive; kernel state (variables, imports) does not.
-
-        Returns (sandbox, None) on success, (None, error_message) on failure.
-        """
-        async with sandbox_startup_gate():
-            sandbox = StatefulSandbox(
-                workspace_path=env.workspace,
-                timeout=self.ptc_timeout,
-                extra_read_paths=[env.env_dir],
-            )
-            try:
-                await self.loop.run_in_executor(None, sandbox.start)
-            except Exception as e:
-                logger.error(f"PTC sandbox restart failed to start for task {env.task_name}: {e}")
-                return None, str(e)
-            setup_result = await self.loop.run_in_executor(
-                None, self._setup_ptc_sandbox_tools, sandbox, env
-            )
-            if not setup_result.get("success"):
-                error_msg = setup_result.get("error", "Unknown error")
-                logger.error(f"PTC sandbox restart setup failed for task {env.task_name}: {error_msg}")
-                await self.loop.run_in_executor(None, sandbox.cleanup)
-                return None, error_msg
-        return sandbox, None
 
     @staticmethod
     def _merge_ptc_db_writes(env: TaskSyncEnvState) -> None:
@@ -1107,27 +1048,6 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             except Exception:
                 pass
             ptc_sandbox = env.ptc_sandbox
-            if ptc_sandbox is None and env.ptc_restart_pending:
-                # A previous call left the kernel unrecoverably dead; start a
-                # fresh one now (lazy, so a rollout that never calls PTC again
-                # pays no bring-up cost).
-                if agent_data.ptc_sandbox_restart_count >= self.ptc_max_restarts:
-                    agent_data.programmatic_tool_call_error_count += 1
-                    return (
-                        "[Error] The Python sandbox died and the restart limit for this "
-                        "task is exhausted; programmatic_tool_call is no longer available. "
-                        "Use the other tools to finish the task."
-                    ), 0.0, False
-                agent_data.ptc_sandbox_restart_count += 1
-                ptc_sandbox, restart_err = await self._restart_ptc_sandbox(env)
-                if ptc_sandbox is None:
-                    agent_data.programmatic_tool_call_error_count += 1
-                    return (
-                        f"[Error] Failed to restart the Python sandbox: {restart_err}\n"
-                        "Another restart will be attempted on your next programmatic_tool_call."
-                    ), 0.0, False
-                env.ptc_sandbox = ptc_sandbox
-                env.ptc_restart_pending = False
             if ptc_sandbox is None:
                 agent_data.programmatic_tool_call_error_count += 1
                 return "Error: PTC sandbox not initialized", 0.0, False
@@ -1136,33 +1056,14 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                 agent_data.programmatic_tool_call_error_count += 1
                 if getattr(ptc_sandbox, "_dead", False):
                     # Unrecoverable death (hard-killed timeout, kernel crash /
-                    # OOM): tear the kernel down so the next call starts a
-                    # fresh one instead of failing for the rest of the task.
-                    # Kernel state is lost; rewrite the (now stale) "subsequent
-                    # code will not run" message and tell the model explicitly.
-                    env.ptc_sandbox = None
-                    env.ptc_restart_pending = True
+                    # OOM): no restart, and no point letting the model keep
+                    # spending tokens against a dead sandbox -- reclaim the
+                    # kernel process now (cleanup() is idempotent, so the
+                    # finally-block cleanup in run() is a no-op) and end the
+                    # episode with the crash message as the last observation
+                    # (final_reward 0, like any unfinished task).
                     await loop.run_in_executor(tool_executor, ptc_sandbox.cleanup)
-                    result = result.replace(
-                        "Sandbox killed; subsequent code will not run.",
-                        "Sandbox killed.",
-                    ).replace(
-                        "(killed after a previous timeout / crash). Subsequent code will not run.",
-                        "(killed after a previous timeout / crash).",
-                    )
-                    if agent_data.ptc_sandbox_restart_count < self.ptc_max_restarts:
-                        result += (
-                            "\n\n[note] The Python sandbox was killed and a fresh one will "
-                            "be started automatically on your next programmatic_tool_call. "
-                            "All variables, imports and function definitions are lost -- "
-                            "re-create any state you still need."
-                        )
-                    else:
-                        result += (
-                            "\n\n[note] The Python sandbox was killed and the restart limit "
-                            "for this task is exhausted; programmatic_tool_call is no "
-                            "longer available. Use the other tools to finish the task."
-                        )
+                    return result, 0.0, True
             return result, 0.0, False
 
         if tool_name == "terminal":
@@ -1536,7 +1437,6 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             "truncated": is_truncated,
             "programmatic_tool_call_count": agent_data.programmatic_tool_call_count,
             "programmatic_tool_call_error_count": ptc_error_count,
-            "ptc_sandbox_restart_count": agent_data.ptc_sandbox_restart_count,
             "ptc_error_penalty": ptc_error_penalty,
             "execute_python_count": agent_data.execute_python_count,
             "terminal_count": agent_data.terminal_count,
@@ -1580,7 +1480,6 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                     "truncated": False,
                     "programmatic_tool_call_count": 0,
                     "programmatic_tool_call_error_count": 0,
-                    "ptc_sandbox_restart_count": 0,
                     "ptc_error_penalty": 0.0,
                     "execute_python_count": 0,
                     "terminal_count": 0,
