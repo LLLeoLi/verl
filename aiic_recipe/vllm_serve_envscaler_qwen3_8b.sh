@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 
-read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/Qwen3-Coder-30B-A3B-Instruct-noptc/v0-20260801-064535/checkpoint-106): " MODEL_PATH
-MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/Qwen3-Coder-30B-A3B-Instruct-noptc/v0-20260801-064535/checkpoint-106}"
+read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/EnvScaler-Qwen3-8B): " MODEL_PATH
+MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/EnvScaler-Qwen3-8B}"
 
 read -p "PORT (默认 8025): " PORT
 PORT="${PORT:-8025}"
 
-read -p "TP (默认 4): " TP
-TP="${TP:-4}"
+read -p "TP (默认 2): " TP
+TP="${TP:-2}"
 
-read -p "DP (默认 2): " DP
-DP="${DP:-2}"
+read -p "DP (默认 4): " DP
+DP="${DP:-4}"
 
 TOK_CFG="${MODEL_PATH}/tokenizer_config.json"
 if [ -f "${TOK_CFG}" ]; then
@@ -41,10 +41,9 @@ echo "  DP:     ${DP}"
 echo "  GPUs:   ${CUDA_VISIBLE_DEVICES:-all}"
 
 vllm serve "${MODEL_PATH}" \
-    --served-model-name "Qwen3-Coder-30B-A3B-Instruct" \
-    --enable-expert-parallel \
+    --served-model-name "Qwen3-8B" \
     --tensor-parallel-size "${TP}" \
     --data-parallel-size "${DP}" \
     --port "${PORT}" \
     --enable-auto-tool-choice \
-    --tool-call-parser qwen3_xml
+    --tool-call-parser hermes

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 
-read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/0627-qwen3_8b-gspo-tp4-pp1-cp2-total_epochs10-group_size32-reward_typebinary-qwen3-8b-ptc-penalty/global_step_100/actor/huggingface): " MODEL_PATH
-MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/0627-qwen3_8b-gspo-tp4-pp1-cp2-total_epochs10-group_size32-reward_typebinary-qwen3-8b-ptc-penalty/global_step_100/actor/huggingface}"
+read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/0725-qwen3_8b-gspo-tp4-pp1-cp2-total_epochs10-group_size16-reward_typebinary-qwen3-8b-ptc-0722/global_step_150/actor/huggingface): " MODEL_PATH
+MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/0725-qwen3_8b-gspo-tp4-pp1-cp2-total_epochs10-group_size16-reward_typebinary-qwen3-8b-ptc-0722/global_step_150/actor/huggingface}"
 
 read -p "PORT (默认 8025): " PORT
 PORT="${PORT:-8025}"
 
-read -p "TP (默认 1): " TP
-TP="${TP:-1}"
+read -p "TP (默认 4): " TP
+TP="${TP:-4}"
 
-read -p "DP (默认 4): " DP
-DP="${DP:-4}"
+read -p "DP (默认 2): " DP
+DP="${DP:-2}"
 
 TOK_CFG="${MODEL_PATH}/tokenizer_config.json"
 if [ -f "${TOK_CFG}" ]; then

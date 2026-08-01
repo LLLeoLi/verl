@@ -29,6 +29,38 @@ fi
 TRAIN_SCRIPT=$1
 shift
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# ----------------------------------------------------------------------------
+# Persist Ray's per-node logs to shared storage.
+#
+# Ray writes worker/raylet logs under /tmp/ray/session_latest/logs on each node.
+# On JD/ECP that path is pod-local and vanishes when the pod is torn down (or
+# OOM-killed) -- exactly when we most need the logs. We can NOT just point Ray's
+# --temp-dir at the share: the raylet/plasma UNIX sockets don't work over NFS and
+# blow past the 107-char sun_path limit. So Ray stays on /tmp and we mirror only
+# the logs/ subtree to the share in the background. Because it runs on a timer,
+# already-synced lines survive a SIGKILL of this pod.
+# ----------------------------------------------------------------------------
+RAY_LOG_SYNC_INTERVAL_S=${RAY_LOG_SYNC_INTERVAL_S:-10}
+RAY_LOG_SYNC_PID=""
+start_ray_log_sync() {
+    local dest="${REPO_ROOT}/logs/ray/$(hostname)-rank${NODE_RANK}"
+    mkdir -p "$dest"
+    echo "Mirroring Ray logs -> $dest every ${RAY_LOG_SYNC_INTERVAL_S}s"
+    (
+        while true; do
+            # session_latest is a symlink Ray maintains to the active session.
+            if [ -d /tmp/ray/session_latest/logs ]; then
+                rsync -a /tmp/ray/session_latest/logs/ "$dest/" 2>/dev/null
+            fi
+            sleep "$RAY_LOG_SYNC_INTERVAL_S"
+        done
+    ) &
+    RAY_LOG_SYNC_PID=$!
+}
+
 # ----------------------------------------------------------------------------
 # JD/ECP rendezvous mapping (platform injects WORLD_SIZE/RANK/MASTER_*)
 # ----------------------------------------------------------------------------
@@ -104,7 +136,15 @@ echo "JD rendezvous: NNODES=$NNODES NODE_RANK=$NODE_RANK NGPUS_PER_NODE=$NGPUS_P
 if [[ "$NNODES" -le 1 ]]; then
     # Single node execution
     echo "Single node detected, running $TRAIN_SCRIPT directly..."
+    start_ray_log_sync
     bash "$TRAIN_SCRIPT" "$@"
+    rc=$?
+    if [ -d /tmp/ray/session_latest/logs ]; then
+        rsync -a /tmp/ray/session_latest/logs/ \
+            "${REPO_ROOT}/logs/ray/$(hostname)-rank${NODE_RANK}/" 2>/dev/null
+    fi
+    [ -n "$RAY_LOG_SYNC_PID" ] && kill "$RAY_LOG_SYNC_PID" 2>/dev/null
+    exit "$rc"
 else
     # Multi-node execution using Ray
     if [[ "$NODE_RANK" == "0" ]]; then
@@ -166,6 +206,7 @@ else
         }"
 
         echo "Ray head started"
+        start_ray_log_sync
         echo "Waiting for $NNODES nodes to join Ray cluster..."
 
         elapsed=0
@@ -229,6 +270,15 @@ else
         ray job submit --address="$MASTER_IP:$MASTER_PORT" \
             --runtime-env-json="$RUNTIME_ENV_JSON" \
             -- bash "$TRAIN_SCRIPT" "${ESCAPED_ARGS[@]}"
+        job_rc=$?
+
+        # Final flush of the head node's own Ray logs, then stop the mirror.
+        if [ -d /tmp/ray/session_latest/logs ]; then
+            rsync -a /tmp/ray/session_latest/logs/ \
+                "${REPO_ROOT}/logs/ray/$(hostname)-rank${NODE_RANK}/" 2>/dev/null
+        fi
+        [ -n "$RAY_LOG_SYNC_PID" ] && kill "$RAY_LOG_SYNC_PID" 2>/dev/null
+        exit "$job_rc"
     else
         # Worker node
         # Connect via the hostname directly (like the colleague's torchrun) and
@@ -250,8 +300,19 @@ else
                   --num-gpus "$NGPUS_PER_NODE" \
                   --min-worker-port=0 \
                   --max-worker-port=0 \
-                  --block
+                  --block &
+        RAY_START_PID=$!
+        # ray start is up now -> begin mirroring this node's logs to the share.
+        start_ray_log_sync
+        wait "$RAY_START_PID"
         rc=$?
+
+        # One final flush so the very last worker/raylet lines reach the share
+        # before the post-mortem below and the pod teardown.
+        if [ -d /tmp/ray/session_latest/logs ]; then
+            rsync -a /tmp/ray/session_latest/logs/ \
+                "${REPO_ROOT}/logs/ray/$(hostname)-rank${NODE_RANK}/" 2>/dev/null
+        fi
 
         # ------------------------------------------------------------------
         # Post-mortem: ray start --block should never exit on its own. Dump

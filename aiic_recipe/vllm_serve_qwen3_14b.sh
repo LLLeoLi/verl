@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/Qwen3-Coder-30B-A3B-Instruct-noptc/v0-20260801-064535/checkpoint-106): " MODEL_PATH
-MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/Qwen3-Coder-30B-A3B-Instruct-noptc/v0-20260801-064535/checkpoint-106}"
+read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/0730-qwen3_14b-gspo-tp4-pp2-cp2-total_epochs10-group_size16-reward_typebinary-qwen3-14b-ptc-0722/global_step_150/actor/huggingface): " MODEL_PATH
+MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/0730-qwen3_14b-gspo-tp4-pp2-cp2-total_epochs10-group_size16-reward_typebinary-qwen3-14b-ptc-0722/global_step_150/actor/huggingface}"
 
 read -p "PORT (默认 8025): " PORT
 PORT="${PORT:-8025}"
@@ -41,8 +41,7 @@ echo "  DP:     ${DP}"
 echo "  GPUs:   ${CUDA_VISIBLE_DEVICES:-all}"
 
 vllm serve "${MODEL_PATH}" \
-    --served-model-name "Qwen3-Coder-30B-A3B-Instruct" \
-    --enable-expert-parallel \
+    --served-model-name "Qwen3-14B" \
     --tensor-parallel-size "${TP}" \
     --data-parallel-size "${DP}" \
     --port "${PORT}" \

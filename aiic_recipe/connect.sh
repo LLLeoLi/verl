@@ -116,6 +116,26 @@ read -p "请输入本地端口号 (默认 $DEFAULT_LOCAL_PORT): " LOCAL_PORT
 LOCAL_PORT=${LOCAL_PORT:-$DEFAULT_LOCAL_PORT}
 
 echo ""
+echo "🔍 正在检查远程端口 $REMOTE_PORT 是否被占用..."
+REMOTE_PID=$(ssh -o ConnectTimeout=10 "$TARGET_HOST" \
+    "ss -tlnp 2>/dev/null | grep ':${REMOTE_PORT} ' | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1")
+
+if [ -n "$REMOTE_PID" ]; then
+    echo "⚠️  远程端口 $REMOTE_PORT 被进程 PID=$REMOTE_PID 占用"
+    read -p "是否终止该进程？[Y/n]: " KILL_CONFIRM
+    KILL_CONFIRM=${KILL_CONFIRM:-Y}
+    if [[ "$KILL_CONFIRM" =~ ^[Yy]$ ]]; then
+        ssh -o ConnectTimeout=10 "$TARGET_HOST" "kill $REMOTE_PID 2>/dev/null && echo KILLED || echo FAIL"
+        sleep 1
+        echo "✅ 远程进程已终止"
+    else
+        echo "⏭️  跳过终止，继续尝试建立连接..."
+    fi
+else
+    echo "✅ 远程端口 $REMOTE_PORT 未被占用"
+fi
+
+echo ""
 echo "🔗 正在建立反向端口转发 (远程 $REMOTE_PORT -> 本地 $LOCAL_PORT)..."
 echo "   命令: ssh -N -R $REMOTE_PORT:127.0.0.1:$LOCAL_PORT $TARGET_HOST"
 echo ""

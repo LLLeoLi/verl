@@ -130,7 +130,7 @@ gpu_memory_utilization=${gpu_memory_utilization:-0.8}
 # help long-context prefill throughput, at the cost of activation memory.
 max_num_batched_tokens=${max_num_batched_tokens:-32768}
 num_workers=${num_workers:-8}
-save_freq=${save_freq:-25}
+save_freq=${save_freq:-10}
 dump_experience_every=${dump_experience_every:-1}
 max_tool_calls=${max_tool_calls:-100}
 reward_type=${reward_type:-dense}
@@ -274,4 +274,13 @@ TRAIN_CMD=(
     "$@"
 )
 
-"${TRAIN_CMD[@]}"
+# ==============================================================================
+# Run training, teeing all output (set -x debug goes to stderr) to logs/.
+# pipefail keeps the script's exit code as the training command's, not tee's.
+# ==============================================================================
+set -o pipefail
+LOG_DIR="${REPO_ROOT}/logs"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/${exp_name}_$(date +%Y%m%d_%H%M%S).log"
+echo "Logging to ${LOG_FILE}"
+"${TRAIN_CMD[@]}" 2>&1 | tee "${LOG_FILE}"
