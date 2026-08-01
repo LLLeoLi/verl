@@ -24,8 +24,8 @@ Differences vs. ``tasksync_agent_loop``:
   - System prompt and PTC tool description match ``task-sync/src/eval.py``.
   - Direct env tool calls are rejected with the eval.py-style error message.
 """
-import importlib.util
 import asyncio
+import importlib.util
 import json
 import logging
 import os
@@ -108,8 +108,14 @@ SYSTEM_PROMPT = (
 
 PTC_TOOL_DESCRIPTION_MINIMAL = 'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. State (variables, imports) persists across calls; use print() to see output.'  # noqa: E501
 
+# NOTE: must stay byte-identical to PTC_TOOL_DESCRIPTION_ONLY in
+# task-sync/src/eval.py (the --only-ptc description) so train-time and
+# eval-time tool schemas match.
 PTC_TOOL_DESCRIPTION_RICH = (
-    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. State (variables, imports) persists across calls; use print() to see output.\n\n'  # noqa: E501
+    'Run Python that calls the tools listed above as `tools["tool_name"](*args, **kwargs)`. '
+    "**This is the ONLY way to invoke env tools** — they cannot be called as standalone tool "
+    "calls, so every env tool must go through this sandbox. "
+    "State (variables, imports) persists across calls. Use print() to see output.\n"
     "USE WHEN: loops, conditionals, error handling, or chaining multiple tool calls with intermediate processing.\n\n"
     "Notes:\n"
     "- Code runs in the workspace directory and file writes are restricted to it, don't write to `/tmp`; always use absolute paths for file writes; os, json, csv, sys are pre-imported.\n"  # noqa: E501
@@ -288,11 +294,26 @@ class TaskSyncAgentData:
         self.success: bool = False
         # claim_done was called (regardless of the score it earned).
         self.claimed_done: bool = False
-        self.tool_call_parse_error_count: int = 0
+        # Episode was cut by a length budget (response_length / max_model_len),
+        # including the case where a tool observation would not fit.
+        self.truncated: bool = False
 
         self.programmatic_tool_call_count: int = 0
         self.programmatic_tool_call_error_count: int = 0
         self.terminal_count: int = 0
+        self.tool_call_parse_error_count: int = 0
+
+        # Token-budget breakdown of the response region:
+        #   thinking_tokens : generated tokens inside <think>...</think> (exact,
+        #                     counted via the </think> token id; 0 for models
+        #                     without a think token, e.g. Qwen3-Coder)
+        #   ptc_code_tokens : re-tokenized `code` of programmatic_tool_call
+        #                     calls (approximate; excludes the <tool_call> wrapper)
+        #   tool_obs_tokens : tool observation tokens appended to the context
+        #                     (exact; mask=0 region)
+        self.thinking_tokens: int = 0
+        self.ptc_code_tokens: int = 0
+        self.tool_obs_tokens: int = 0
 
         self.current_tool_calls: list[dict[str, Any]] = []
 
@@ -320,6 +341,16 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
             f"ptc_desc must be one of {list(PTC_DESCRIPTIONS)}, got '{self.ptc_desc}'"
         )
 
+        # tool_call_format selects how the inner of <tool_call>...</tool_call>
+        # (and bare top-level blobs) is parsed:
+        #   "auto" -- try XML <function=...>, fall back to JSON (default)
+        #   "xml"  -- Qwen3-Coder style only
+        #   "json" -- Hermes JSON only (Qwen3-8B); malformed -> log + drop
+        self.tool_call_format = env_cfg.get("tool_call_format", "auto")
+        assert self.tool_call_format in ("auto", "xml", "json"), (
+            f"tool_call_format must be 'auto', 'xml', or 'json', got '{self.tool_call_format}'"
+        )
+
         self.reward_type = env_cfg.get("reward_type", "dense")
         assert self.reward_type in ("dense", "binary"), (
             f"reward_type must be 'dense' or 'binary', got '{self.reward_type}'"
@@ -336,6 +367,18 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
         self.max_model_len = self.rollout_config.get(
             "max_model_len", self.prompt_length + self.response_length
         )
+
+        # Resolve <think>/</think> token ids for the thinking-token breakdown.
+        # Qwen3 thinking models have them as real tokens; tokenizers without
+        # them (e.g. Qwen3-Coder) resolve to None/unk and the counter stays 0.
+        unk_id = getattr(self.tokenizer, "unk_token_id", None)
+
+        def _tok_id(tok: str) -> Optional[int]:
+            tid = self.tokenizer.convert_tokens_to_ids(tok)
+            return tid if isinstance(tid, int) and tid >= 0 and tid != unk_id else None
+
+        self.think_start_token_id = _tok_id("<think>")
+        self.think_end_token_id = _tok_id("</think>")
 
         logger.info("TaskSyncPTCAgentLoop initialized")
 
@@ -437,12 +480,14 @@ class TaskSyncPTCAgentLoop(AgentLoopBase):
                         state = await self._handle_pending_state(agent_data, sampling_params)
                     elif state == AgentState.GENERATING:
                         if len(agent_data.response_mask) >= self.response_length:
+                            agent_data.truncated = True
                             state = AgentState.TERMINATED
                             continue
                         if tool_call_count >= max_tool_calls:
                             state = AgentState.TERMINATED
                             continue
                         if len(agent_data.prompt_ids) >= self.max_model_len - 1:
+                            agent_data.truncated = True
                             state = AgentState.TERMINATED
                             continue
 
@@ -691,6 +736,19 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         agent_data.prompt_ids += agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
 
+        # Thinking-token accounting: tokens from turn start through </think>.
+        # If the turn was cut before </think> (length truncation), everything
+        # from <think> onward is thinking.
+        if self.think_end_token_id is not None:
+            turn_ids = agent_data.response_ids
+            try:
+                agent_data.thinking_tokens += turn_ids.index(self.think_end_token_id) + 1
+            except ValueError:
+                if self.think_start_token_id is not None and self.think_start_token_id in turn_ids:
+                    agent_data.thinking_tokens += (
+                        len(turn_ids) - turn_ids.index(self.think_start_token_id)
+                    )
+
         if output.log_probs:
             agent_data.response_logprobs += output.log_probs
 
@@ -783,10 +841,12 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         tool_response_ids = await self.apply_chat_template(tool_messages)
 
         if len(agent_data.response_mask) + len(tool_response_ids) >= self.response_length:
+            agent_data.truncated = True
             return AgentState.TERMINATED
 
         agent_data.prompt_ids += tool_response_ids
         agent_data.response_mask += [0] * len(tool_response_ids)
+        agent_data.tool_obs_tokens += len(tool_response_ids)
 
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(tool_response_ids)
@@ -852,6 +912,14 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         if tool_name == "programmatic_tool_call":
             code = arguments.get("code", "")
             agent_data.programmatic_tool_call_count += 1
+            # Approximate PTC token spend: re-tokenize the code payload (the
+            # <tool_call> wrapper and parameter tags are not included).
+            try:
+                agent_data.ptc_code_tokens += len(
+                    self.tokenizer.encode(code, add_special_tokens=False)
+                )
+            except Exception:
+                pass
             ptc_sandbox = env.ptc_sandbox
             if ptc_sandbox is None:
                 agent_data.programmatic_tool_call_error_count += 1
@@ -1024,13 +1092,69 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                     return j
         return -1
 
-    def _parse_tool_call(self, block: str, errors: list[str]) -> Optional[dict[str, Any]]:
+    def _parse_tool_call(
+        self, block: str, errors: list[str]
+    ) -> Optional[dict[str, Any]]:
         """Parse a single tool call from the contents of a <tool_call>...</tool_call>
-        block. Requires <function=NAME>...</function> to be properly closed, and
-        each <parameter=NAME>...</parameter> to be properly closed. Returns None
-        (dropping the entire call) on any malformed structure, appending a
-        descriptive message to ``errors`` so the caller can surface it to the
-        model."""
+        block. Dispatches on self.tool_call_format. Appends a descriptive message
+        to ``errors`` on failure so the caller can surface it to the model."""
+        fmt = getattr(self, "tool_call_format", "auto")
+        stripped = block.strip()
+
+        if fmt == "json":
+            return self._parse_tool_call_json(stripped, errors)
+        if fmt == "xml":
+            return self._parse_tool_call_xml(block, errors)
+        # auto
+        if "<function=" in block:
+            return self._parse_tool_call_xml(block, errors)
+        if stripped.startswith("{"):
+            return self._parse_tool_call_json(stripped, errors)
+        msg = "Tool call inside <tool_call> has neither <function=...> nor a JSON object."
+        logger.warning(msg + " Dropping.")
+        errors.append(msg)
+        return None
+
+    def _parse_tool_call_json(
+        self, blob: str, errors: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Parse Hermes-style JSON tool call: {"name": ..., "arguments": {...}}."""
+        try:
+            obj = json.loads(blob)
+        except (json.JSONDecodeError, ValueError) as e:
+            preview = blob[:200].replace("\n", "\\n")
+            logger.error(f"tool_call_format=json: JSON parse failed ({e}); dropping. raw='{preview}'")
+            errors.append(f"JSON parse failed: {e}. Snippet: {preview}")
+            return None
+        if not isinstance(obj, dict) or "name" not in obj:
+            preview = blob[:200].replace("\n", "\\n")
+            logger.error(f"tool_call_format=json: missing 'name' field; dropping. raw='{preview}'")
+            errors.append("JSON tool call missing required 'name' field.")
+            return None
+        name = obj["name"]
+        if not isinstance(name, str) or not name:
+            logger.error(f"tool_call_format=json: invalid 'name' field; dropping. raw='{blob[:200]}'")
+            errors.append("JSON tool call 'name' field is empty or not a string.")
+            return None
+        args = obj.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError) as e:
+                errors.append(
+                    f"'arguments' for tool '{name}' was a string but not valid JSON: {e}"
+                )
+                args = {}
+        if not isinstance(args, dict):
+            errors.append(
+                f"'arguments' for tool '{name}' must be a JSON object, got {type(args).__name__}."
+            )
+            args = {}
+        return {"name": name, "arguments": args}
+
+    def _parse_tool_call_xml(
+        self, block: str, errors: list[str]
+    ) -> Optional[dict[str, Any]]:
         try:
             func_start = block.find("<function=")
             if func_start == -1:
@@ -1068,7 +1192,7 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                 for param in params[1:]:
                     pname_end = param.find(">")
                     if pname_end == -1:
-                        msg = f"Malformed <parameter=...> tag in '{func_name}' (missing '>')."
+                        msg = f"Malformed <parameter=...> in '{func_name}' (missing '>')."
                         logger.warning(msg + " Dropping call.")
                         errors.append(msg)
                         return None
@@ -1094,7 +1218,7 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             return {"name": func_name, "arguments": arguments}
         except Exception as e:
             logger.warning(f"Error parsing tool call: {e}")
-            errors.append(f"Error parsing tool call: {e}")
+            errors.append(f"Unexpected error parsing XML tool call: {e}")
             return None
 
     def _parse_param_value(self, param_value_raw: str) -> Any:
@@ -1131,6 +1255,17 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         rollout_length = len(prompt_ids) + len(response_ids)
 
         if len(prompt_ids) > self.prompt_length:
+            # Left-truncating the prompt makes training condition on a shorter
+            # context than the rollout actually saw -- every response logprob
+            # is then biased. Loud warning so oversized task prompts get fixed
+            # at the source (prompt.md / tool schemas) instead of silently
+            # corrupting the batch.
+            logger.warning(
+                f"task '{agent_data.env.task_name}': initial prompt "
+                f"({len(prompt_ids)} tokens) exceeds prompt_length "
+                f"({self.prompt_length}); left-truncating -- training/rollout "
+                f"context mismatch for this sample."
+            )
             prompt_ids = prompt_ids[-self.prompt_length :]
 
         response_ids = response_ids[: self.response_length]
@@ -1142,15 +1277,19 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
         )
 
         is_truncated = (
-            len(agent_data.response_mask) >= self.response_length
+            agent_data.truncated
+            or len(agent_data.response_mask) >= self.response_length
             or rollout_length >= self.max_model_len
         )
 
         ptc_error_count = agent_data.programmatic_tool_call_error_count
-        ptc_error_penalty = self.ptc_error_penalty * ptc_error_count
+        requested_penalty = self.ptc_error_penalty * ptc_error_count
         # Clip to >= 0 so the penalty can never make a non-negative reward
         # turn negative (avoids GRPO advantage flips driven purely by errors).
-        penalized_reward = max(float(agent_data.final_reward) - ptc_error_penalty, 0.0)
+        penalized_reward = max(float(agent_data.final_reward) - requested_penalty, 0.0)
+        # Report the penalty actually applied (post-clip), not the requested
+        # one, so reward/mean_ptc_error_penalty reflects real reward impact.
+        ptc_error_penalty = float(agent_data.final_reward) - penalized_reward
 
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -1164,6 +1303,10 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                 tool_calls=agent_data.metrics.get("tool_calls", 0.0),
                 num_preempted=agent_data.metrics.get("num_preempted", -1),
             ),
+            # task-sync computes its reward inside env.step(); surface it here so
+            # the agent_loop `_compute_score` path short-circuits and does not
+            # invoke the generic reward_loop worker (which expects `data_source`
+            # in non_tensor_batch -- task-sync never populates that field).
             reward_score=penalized_reward,
             extra_fields={},
         )
@@ -1177,15 +1320,23 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             "acc": float(agent_data.success),
             "episode_turns": agent_data.assistant_turns,
             "rollout_length": rollout_length,
+            # Token-budget breakdown (all pre-truncation, like rollout_length):
+            # generated_tokens ~= thinking + ptc_code + prose/other tool calls;
+            # rollout_length ~= prompt + generated_tokens + tool_obs_tokens.
+            "generated_tokens": int(sum(agent_data.response_mask)),
+            "thinking_tokens": agent_data.thinking_tokens,
+            "ptc_code_tokens": agent_data.ptc_code_tokens,
+            "tool_obs_tokens": agent_data.tool_obs_tokens,
             "truncated": is_truncated,
             "programmatic_tool_call_count": agent_data.programmatic_tool_call_count,
             "programmatic_tool_call_error_count": ptc_error_count,
             "ptc_error_penalty": ptc_error_penalty,
-            "tool_call_parse_error_count": agent_data.tool_call_parse_error_count,
-            # Kept for trainer-side metric aggregation parity with tasksync_agent.
+            # No execute_python / direct env tools in this loop; keep the keys
+            # (always 0) for trainer-side metric aggregation parity.
             "execute_python_count": 0,
             "terminal_count": agent_data.terminal_count,
             "env_tool_count": 0,
+            "tool_call_parse_error_count": agent_data.tool_call_parse_error_count,
         }
         output.extra_fields["messages"] = agent_data.messages
 
@@ -1204,6 +1355,8 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
             multi_modal_data={},
             num_turns=0,
             metrics=AgentLoopMetrics(),
+            # See note in build_output: task-sync must surface reward_score to
+            # short-circuit the generic reward_loop worker.
             reward_score=0.0,
             extra_fields={
                 "reward_extra_info": {
@@ -1215,14 +1368,18 @@ env = _mod.Task_Env(db_path={repr(ptc_db_path)}, workspace={repr(env.workspace)}
                     "acc": 0.0,
                     "episode_turns": 0,
                     "rollout_length": 0,
+                    "generated_tokens": 0,
+                    "thinking_tokens": 0,
+                    "ptc_code_tokens": 0,
+                    "tool_obs_tokens": 0,
                     "truncated": False,
                     "programmatic_tool_call_count": 0,
                     "programmatic_tool_call_error_count": 0,
                     "ptc_error_penalty": 0.0,
-                    "tool_call_parse_error_count": 0,
                     "execute_python_count": 0,
                     "terminal_count": 0,
                     "env_tool_count": 0,
+                    "tool_call_parse_error_count": 0,
                 },
                 "messages": [],
             },

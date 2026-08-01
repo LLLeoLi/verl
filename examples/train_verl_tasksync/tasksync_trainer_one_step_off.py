@@ -93,18 +93,14 @@ class TaskSyncOneStepOffTrainer(OneStepOffRayTrainer):
         val_ratio = float(env_cfg.get("val_ratio", 0.0))
         seed = config.get("seed", 42)
 
+        # "ptc-only" behaves like "ptc" at the trainer level; the PTC-only
+        # rollout semantics live in the tasksync_ptc_agent loop, selected via
+        # rollout.agent.default_agent_loop.
         self.ptc_mode = env_cfg.get("ptc_mode", "ptc")
-        assert self.ptc_mode in ("ptc", "no-ptc", "mixed"), (
-            f"ptc_mode must be 'ptc', 'no-ptc', or 'mixed', got '{self.ptc_mode}'"
+        assert self.ptc_mode in ("ptc", "no-ptc", "ptc-only"), (
+            f"ptc_mode must be 'ptc', 'no-ptc', or 'ptc-only', got '{self.ptc_mode}'"
         )
         self.ptc_desc = env_cfg.get("ptc_desc", "rich")
-        if self.ptc_mode == "mixed":
-            old_mini = config.actor_rollout_ref.actor.ppo_mini_batch_size
-            with open_dict(config):
-                config.actor_rollout_ref.actor.ppo_mini_batch_size = old_mini * 2
-            logger.info(
-                f"[ptc_mode=mixed] doubled ppo_mini_batch_size: {old_mini} -> {old_mini * 2}"
-            )
 
         common_kwargs = dict(
             tasks_dir=tasks_dir,
@@ -283,12 +279,10 @@ class TaskSyncOneStepOffTrainer(OneStepOffRayTrainer):
 
         env_groups = dataset.get_batch(batch_index)
 
-        if self.ptc_mode == "mixed":
-            ptc_assignments = [(True, "ptc"), (False, "noptc")]
-        elif self.ptc_mode == "ptc":
-            ptc_assignments = [(True, "ptc")]
-        else:
+        if self.ptc_mode == "no-ptc":
             ptc_assignments = [(False, "noptc")]
+        else:  # ptc / ptc-only
+            ptc_assignments = [(True, "ptc")]
 
         raw_prompts = []
         task_uids = []

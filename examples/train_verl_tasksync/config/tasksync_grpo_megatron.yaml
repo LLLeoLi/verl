@@ -48,10 +48,10 @@ actor_rollout_ref:
     max_tool_calls: 50
     max_turns: 30
     reward_type: dense      # "dense" or "binary"
-    # ptc_mode: "ptc" -> all rollouts have programmatic_tool_call;
+    # ptc_mode: "ptc" -> all rollouts have programmatic_tool_call (plus direct env tools);
     #           "no-ptc" -> none do;
-    #           "mixed" -> each task contributes both PTC and no-PTC groups
-    #                     (effective batch doubles; ppo_mini_batch_size auto-doubled).
+    #           "ptc-only" -> env tools reachable only via programmatic_tool_call
+    #                     (pair with rollout.agent.default_agent_loop=tasksync_ptc_agent).
     ptc_mode: ptc
     # ptc_desc: "rich" -> full PTC tool description with examples;
     #           "minimal" -> one-liner (matches ptc-mini SFT data).

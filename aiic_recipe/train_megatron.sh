@@ -148,10 +148,17 @@ save_freq=${save_freq:-25}
 dump_experience_every=${dump_experience_every:-1}
 max_tool_calls=${max_tool_calls:-100}
 reward_type=${reward_type:-dense}
+# ptc_mode:
+#   ptc      -> tasksync_agent loop; direct env tools + execute_python + PTC all available
+#   no-ptc   -> tasksync_agent loop; PTC tool not exposed
+#   ptc-only -> tasksync_ptc_agent loop; env tools ONLY reachable via
+#               programmatic_tool_call (direct calls are rejected and count
+#               toward ptc_error_penalty), no execute_python — matches
+#               task-sync/src/eval.py.
 ptc_mode=${ptc_mode:-ptc}
 case "${ptc_mode}" in
-    ptc|no-ptc|mixed) ;;
-    *) echo "ERROR: --ptc_mode must be 'ptc', 'no-ptc', or 'mixed' (got '${ptc_mode}')" >&2; exit 1 ;;
+    ptc|no-ptc|ptc-only) ;;
+    *) echo "ERROR: --ptc_mode must be 'ptc', 'no-ptc', or 'ptc-only' (got '${ptc_mode}')" >&2; exit 1 ;;
 esac
 ptc_desc=${ptc_desc:-rich}
 case "${ptc_desc}" in
@@ -162,7 +169,12 @@ ptc_error_penalty=${ptc_error_penalty:-0.0}
 dense_epoch=${dense_epoch:-0}
 val_ratio=${val_ratio:-0.0}
 test_freq=${test_freq:--1}
-agent_loop=${agent_loop:-tasksync_agent}
+# Agent loop follows ptc_mode unless --agent_loop is passed explicitly.
+if [ "${ptc_mode}" = "ptc-only" ]; then
+    agent_loop=${agent_loop:-tasksync_ptc_agent}
+else
+    agent_loop=${agent_loop:-tasksync_agent}
+fi
 
 # ==============================================================================
 # Experiment name

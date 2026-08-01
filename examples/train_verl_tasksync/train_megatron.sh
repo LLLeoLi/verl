@@ -115,12 +115,18 @@ max_tool_calls=${max_tool_calls:-50}
 reward_type=${reward_type:-dense}
 ptc_mode=${ptc_mode:-ptc}
 case "${ptc_mode}" in
-    ptc|no-ptc|mixed) ;;
-    *) echo "ERROR: --ptc_mode must be 'ptc', 'no-ptc', or 'mixed' (got '${ptc_mode}')" >&2; exit 1 ;;
+    ptc|no-ptc|ptc-only) ;;
+    *) echo "ERROR: --ptc_mode must be 'ptc', 'no-ptc', or 'ptc-only' (got '${ptc_mode}')" >&2; exit 1 ;;
 esac
 dense_epoch=${dense_epoch:-0}
 val_ratio=${val_ratio:-0.0}
 test_freq=${test_freq:--1}
+# Agent loop follows ptc_mode: ptc-only routes to the PTC-only loop.
+if [ "${ptc_mode}" = "ptc-only" ]; then
+    agent_loop=tasksync_ptc_agent
+else
+    agent_loop=tasksync_agent
+fi
 
 # ==============================================================================
 # Experiment name
@@ -168,7 +174,7 @@ TRAIN_CMD=(
     actor_rollout_ref.rollout.max_model_len=${total_len}
     actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp}
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization}
-    actor_rollout_ref.rollout.agent.default_agent_loop=tasksync_agent
+    actor_rollout_ref.rollout.agent.default_agent_loop=${agent_loop}
     actor_rollout_ref.rollout.agent.num_workers=${num_workers}
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${ppo_micro_bsz_per_gpu}
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${max_token_len_per_gpu}

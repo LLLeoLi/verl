@@ -389,14 +389,15 @@ class TaskSyncAgentLoop(AgentLoopBase):
         self.data_py_timeout = env_cfg.get("data_py_timeout", 120)
 
         # ptc_mode controls whether the programmatic_tool_call tool is exposed.
-        #   "ptc"     -> every rollout has PTC
-        #   "no-ptc"  -> no rollout has PTC
-        #   "mixed"   -> trainer assigns per-group: half of groups have PTC, half don't.
-        #                Per-sample enable_ptc is passed in via raw_prompt; the value
-        #                read here is only used as a fallback.
+        #   "ptc"      -> every rollout has PTC (alongside direct env tools)
+        #   "no-ptc"   -> no rollout has PTC
+        #   "ptc-only" -> served by the tasksync_ptc_agent loop instead; if this
+        #                 loop still runs with it, it degrades to "ptc" behavior.
+        # Per-sample enable_ptc passed in via raw_prompt takes precedence; the
+        # value read here is only used as a fallback.
         self.ptc_mode = env_cfg.get("ptc_mode", "ptc")
-        assert self.ptc_mode in ("ptc", "no-ptc", "mixed"), (
-            f"ptc_mode must be 'ptc', 'no-ptc', or 'mixed', got '{self.ptc_mode}'"
+        assert self.ptc_mode in ("ptc", "no-ptc", "ptc-only"), (
+            f"ptc_mode must be 'ptc', 'no-ptc', or 'ptc-only', got '{self.ptc_mode}'"
         )
         self.enable_ptc_default = self.ptc_mode != "no-ptc"
 

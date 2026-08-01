@@ -109,22 +109,15 @@ class TaskSyncTrainer(RayPPOTrainer):
         val_ratio = float(env_cfg.get("val_ratio", 0.0))
         seed = config.get("seed", 42)
 
-        # ptc_mode = "ptc" | "no-ptc" | "mixed". In mixed mode each task is
-        # rolled out twice -- once with PTC enabled and once without -- so the
-        # effective per-batch sample count doubles. Double ppo_mini_batch_size
-        # to keep the per-step PPO update semantics unchanged.
+        # ptc_mode = "ptc" | "no-ptc" | "ptc-only". "ptc-only" behaves like
+        # "ptc" at the trainer level (one PTC-enabled group per task); the
+        # PTC-only rollout semantics live in the tasksync_ptc_agent loop,
+        # selected via rollout.agent.default_agent_loop.
         self.ptc_mode = env_cfg.get("ptc_mode", "ptc")
-        assert self.ptc_mode in ("ptc", "no-ptc", "mixed"), (
-            f"ptc_mode must be 'ptc', 'no-ptc', or 'mixed', got '{self.ptc_mode}'"
+        assert self.ptc_mode in ("ptc", "no-ptc", "ptc-only"), (
+            f"ptc_mode must be 'ptc', 'no-ptc', or 'ptc-only', got '{self.ptc_mode}'"
         )
         self.ptc_desc = env_cfg.get("ptc_desc", "rich")
-        if self.ptc_mode == "mixed":
-            old_mini = config.actor_rollout_ref.actor.ppo_mini_batch_size
-            with open_dict(config):
-                config.actor_rollout_ref.actor.ppo_mini_batch_size = old_mini * 2
-            logger.info(
-                f"[ptc_mode=mixed] doubled ppo_mini_batch_size: {old_mini} -> {old_mini * 2}"
-            )
 
         common_kwargs = dict(
             tasks_dir=tasks_dir,
@@ -863,15 +856,13 @@ class TaskSyncTrainer(RayPPOTrainer):
 
         env_groups = dataset.get_batch(batch_index)
 
-        # In "mixed" mode each task contributes two GRPO groups -- one with PTC
-        # enabled and one without -- so they are normalized as separate groups.
-        # In pure modes there is exactly one group per task with the mode's flag.
-        if self.ptc_mode == "mixed":
-            ptc_assignments = [(True, "ptc"), (False, "noptc")]
-        elif self.ptc_mode == "ptc":
-            ptc_assignments = [(True, "ptc")]
-        else:  # no-ptc
+        # Exactly one GRPO group per task. "ptc-only" rolls out with PTC
+        # enabled like "ptc" -- the PTC-only restriction is enforced by the
+        # tasksync_ptc_agent loop, not here.
+        if self.ptc_mode == "no-ptc":
             ptc_assignments = [(False, "noptc")]
+        else:  # ptc / ptc-only
+            ptc_assignments = [(True, "ptc")]
 
         raw_prompts = []
         task_uids = []
