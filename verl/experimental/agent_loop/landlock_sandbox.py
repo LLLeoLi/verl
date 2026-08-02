@@ -84,15 +84,27 @@ _DEFAULT_MAX_OUTPUT_CHARS = int(os.getenv("VERL_SANDBOX_MAX_OUTPUT_CHARS", "5000
 # tempfile.mkdtemp under /tmp holding that task's data.db / answers): /tmp is
 # remounted as a fresh tmpfs and only the caller's workspace / env_dir / tmpdir
 # are bound back over it. Writes stay confined to the workspace + a private
-# /tmp & /dev/shm + the kernel tmpdir (the same set Landlock enforced). Network
-# is intentionally NOT isolated (kernel<->client ZMQ uses 127.0.0.1 and rollouts
-# may need outbound access).
+# /tmp & /dev/shm + the kernel tmpdir (the same set Landlock enforced).
+#
+# The PID namespace IS isolated (see _UNSHARE_PID) so sandboxed code cannot see
+# or signal the Ray runtime. Network is intentionally NOT isolated (kernel<->
+# client ZMQ uses 127.0.0.1 and rollouts may need outbound access).
 #
 # Set VERL_SANDBOX_USE_BWRAP=0 to fall back to the Landlock path. bwrap and
 # Landlock are not stacked: bwrap's fresh /tmp & /dev/shm tmpfs aren't in a
 # host-built Landlock allowlist, so a Landlock ruleset would wrongly block them.
 _BWRAP_BIN = shutil.which("bwrap")
 _USE_BWRAP = os.getenv("VERL_SANDBOX_USE_BWRAP", "1") != "0" and _BWRAP_BIN is not None
+# PID-namespace isolation. Without it the sandbox shares the pod's PID
+# namespace, so `--proc /proc` still enumerates every process on the node and
+# model-generated code running as root can signal ANY of them -- `pkill -f
+# python`, `killall python3` or `kill -TERM -1` reach the raylet, the Ray
+# WorkerDicts and the vLLM servers, taking the whole node down with a graceful
+# SIGTERM ("the actor's node was terminated expectedly: received SIGTERM").
+# Landlock confines the filesystem only; it does not scope signals. Unsharing
+# the PID namespace makes those commands structurally unable to name anything
+# outside the sandbox. Set VERL_SANDBOX_UNSHARE_PID=0 to disable.
+_UNSHARE_PID = os.getenv("VERL_SANDBOX_UNSHARE_PID", "1") != "0"
 # Read-only system dirs the kernel needs to run Python + user code (imports,
 # shared libs, certs, system tools). Colon-separated; missing paths are skipped
 # (--ro-bind-try). Set to "/" to expose the whole root read-only (old behaviour).
@@ -155,6 +167,66 @@ def bwrap_usable() -> bool:
             )
             ok = False
         _BWRAP_USABLE = ok
+        return ok
+
+
+# Whether bwrap can additionally create a PID namespace here. Creating one needs
+# CAP_SYS_ADMIN, which --unshare-user-try grants inside the new user namespace,
+# but some runtimes block CLONE_NEWPID via seccomp. Probed separately from
+# bwrap_usable() so a refusal degrades to the old shared-PID-namespace behaviour
+# instead of failing every sandbox bring-up.
+_BWRAP_PID_NS: "bool | None" = None
+_BWRAP_PID_NS_LOCK = threading.Lock()
+
+
+def bwrap_pid_ns_usable() -> bool:
+    """True iff bwrap can create a PID namespace here (probed once, cached)."""
+    global _BWRAP_PID_NS
+    if not _UNSHARE_PID or not bwrap_usable():
+        return False
+    if _BWRAP_PID_NS is not None:
+        return _BWRAP_PID_NS
+    with _BWRAP_PID_NS_LOCK:
+        if _BWRAP_PID_NS is not None:
+            return _BWRAP_PID_NS
+        try:
+            r = subprocess.run(
+                [
+                    _BWRAP_BIN, "--unshare-user-try", "--unshare-pid",
+                    "--ro-bind", "/", "/", "--proc", "/proc", "--", "true",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            ok = r.returncode == 0
+            if ok:
+                _log_once(
+                    "bwrap_pid_ns_ok",
+                    logging.INFO,
+                    "[sandbox] PID-namespace isolation ON: sandboxed code cannot "
+                    "see or signal processes outside its own rollout.",
+                )
+            else:
+                _log_once(
+                    "bwrap_pid_ns_unusable",
+                    logging.WARNING,
+                    f"[sandbox] bwrap cannot create a PID namespace here "
+                    f"({r.stderr.decode(errors='replace').strip() or 'unknown error'}); "
+                    f"running WITHOUT PID isolation. Sandboxed code shares the pod's "
+                    f"PID namespace and can signal the Ray runtime (pkill / kill -1 "
+                    f"will take the node down). Allow CLONE_NEWPID in the pod "
+                    f"securityContext, or set VERL_SANDBOX_UNSHARE_PID=0 to silence.",
+                )
+        except (OSError, subprocess.SubprocessError) as e:
+            _log_once(
+                "bwrap_pid_ns_probe_error",
+                logging.WARNING,
+                f"[sandbox] bwrap PID-namespace probe failed ({e}); "
+                f"running WITHOUT PID isolation.",
+            )
+            ok = False
+        _BWRAP_PID_NS = ok
         return ok
 
 
@@ -631,22 +703,24 @@ def truncate_output(text: str, limit: int) -> str:
     )
 
 
-def _find_child_pid(ppid: int) -> int | None:
-    """Return the single child PID of `ppid`, or None. Used to locate the kernel
-    when it runs under bwrap (bwrap is the immediate child / process-group
-    leader; the kernel is bwrap's child). Tries the cheap children file, then
-    falls back to scanning /proc."""
+def _child_pids(ppid: int) -> list[int]:
+    """Immediate children of `ppid`, in HOST pid terms.
+
+    Tries the cheap children file (needs CONFIG_PROC_CHILDREN), then falls back
+    to scanning /proc for entries whose stat ppid matches.
+    """
     try:
         with open(f"/proc/{ppid}/task/{ppid}/children") as f:
-            kids = f.read().split()
+            kids = [int(x) for x in f.read().split()]
         if kids:
-            return int(kids[0])
+            return kids
     except (OSError, ValueError):
         pass
+    out = []
     try:
         entries = os.listdir("/proc")
     except OSError:
-        return None
+        return out
     for e in entries:
         if not e.isdigit():
             continue
@@ -656,10 +730,55 @@ def _find_child_pid(ppid: int) -> int | None:
             # Fields after the (possibly space/paren-containing) comm: state ppid
             after = data[data.rfind(")") + 2:].split()
             if int(after[1]) == ppid:
-                return int(e)
+                out.append(int(e))
         except (OSError, IndexError, ValueError):
             continue
-    return None
+    return out
+
+
+def _find_kernel_pid(bwrap_pid: int, max_depth: int = 4) -> int | None:
+    """Locate the ipykernel process beneath `bwrap_pid`, in HOST pid terms.
+
+    The layering depends on whether the PID namespace was unshared:
+
+        bwrap -> kernel                     (shared PID namespace)
+        bwrap -> ns-init -> kernel          (--unshare-pid; bwrap's do_init()
+                                             is PID 1 inside and reaps zombies)
+
+    So we can't just take the immediate child -- under --unshare-pid that is the
+    init, and SIGINTing it would not interrupt the running cell. Walk the
+    descendants and pick the one that is actually the kernel. Called right after
+    wait_for_ready(), before any user code runs, so the tree is still the plain
+    chain above. Returns None if it can't be identified; the caller then falls
+    back to the process-group path.
+    """
+    frontier = [bwrap_pid]
+    deepest = None
+    for _ in range(max_depth):
+        nxt = []
+        for pid in frontier:
+            for kid in _child_pids(pid):
+                nxt.append(kid)
+                try:
+                    with open(f"/proc/{kid}/cmdline", "rb") as f:
+                        argv = f.read().split(b"\0")
+                except OSError:
+                    continue
+                if not argv or not argv[0]:
+                    continue
+                # bwrap's init keeps bwrap's own argv, which ENDS in
+                # "... -- python -m ipykernel_launcher" -- so a plain substring
+                # match would pick the init and SIGINT would never reach the
+                # kernel. Require argv[0] to be the interpreter, not bwrap.
+                if os.path.basename(argv[0]) == b"bwrap":
+                    continue
+                if b"ipykernel" in b" ".join(argv):
+                    return kid
+        if not nxt:
+            break
+        deepest = nxt[0]
+        frontier = nxt
+    return deepest
 
 
 def _force_kill_pid(pid: int, expected_starttime: int | None = None):
@@ -1014,15 +1133,25 @@ def _build_bwrap_argv(
     connection-file tmpdir) + a private /tmp & /dev/shm. /tmp is a fresh tmpfs
     so sibling rollouts' env_dirs are hidden; the caller's own paths are bound
     back AFTER it. workspace is bound after the read-only extras so it overlays
-    read-write even when it sits inside one (workspace == env_dir/workspace). No
-    --unshare-* so the process keeps loopback (kernel ZMQ) and stays in our
-    process group (killpg)."""
+    read-write even when it sits inside one (workspace == env_dir/workspace).
+
+    --unshare-pid (when the runtime allows it, see bwrap_pid_ns_usable) puts the
+    sandbox in its own PID namespace so model-generated `pkill` / `kill -TERM -1`
+    cannot reach the Ray runtime. The network namespace is deliberately NOT
+    unshared: the kernel<->client ZMQ transport needs loopback. Teardown is
+    unaffected -- start_new_session=True sets the process group on the HOST side,
+    so os.killpg(proc.pid, ...) still reaches bwrap, and killing the namespace's
+    init tears down everything inside it."""
     # --unshare-user-try: when running as root WITHOUT CAP_SYS_ADMIN (the jd k8s
     # container), bwrap won't create a user namespace by default and the mount
     # namespace then fails with "Operation not permitted". Forcing a user
     # namespace first grants the caps needed for the mount ns. No-op where bwrap
     # already unshares userns (e.g. unprivileged callers).
     argv = [_BWRAP_BIN, "--unshare-user-try"]
+    if bwrap_pid_ns_usable():
+        # Must be paired with the --proc below: a fresh procfs is what makes the
+        # new namespace's process list the only one visible.
+        argv += ["--unshare-pid"]
     for p in _BWRAP_READ_PATHS:
         argv += ["--ro-bind-try", p, p]
     argv += [
@@ -1199,7 +1328,8 @@ class StatefulSandbox:
 
         kernel_cmd = [sys.executable, "-m", "ipykernel_launcher", "-f", str(self._conn_file)]
         if use_bwrap:
-            # bwrap runs in the same process group (no --unshare-pid), so the
+            # bwrap stays in the process group set by start_new_session=True
+            # (a PID namespace does not change the host-side pgid), so the
             # existing os.killpg(proc.pid, ...) paths still reach the kernel.
             kernel_cmd = (
                 _build_bwrap_argv(
@@ -1286,12 +1416,13 @@ class StatefulSandbox:
         self._client = client
         self._landlock_active = landlock_ok
 
-        # Resolve the kernel PID for interrupts. Under bwrap the kernel is
-        # bwrap's child; fall back to bwrap's own pid if it can't be found (then
-        # interrupts degrade to the killpg path, same as no-bwrap).
+        # Resolve the kernel PID for interrupts. Under bwrap the kernel sits one
+        # (or, with --unshare-pid, two) levels below bwrap; fall back to bwrap's
+        # own pid if it can't be found (then interrupts degrade to the killpg
+        # path, same as no-bwrap).
         self._kernel_pid = self._proc.pid
         if use_bwrap:
-            child = _find_child_pid(self._proc.pid)
+            child = _find_kernel_pid(self._proc.pid)
             if child is not None:
                 self._kernel_pid = child
 
