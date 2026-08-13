@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 
-read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/baselines/Arctic-AWM-14B): " MODEL_PATH
-MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/baselines/Arctic-AWM-14B}"
+read -p "MODEL_PATH (默认 /mnt/public_02/models/qwen3_235b_a22b): " MODEL_PATH
+MODEL_PATH="${MODEL_PATH:-/mnt/public_02/models/qwen3_235b_a22b}"
 
 read -p "PORT (默认 8025): " PORT
 PORT="${PORT:-8025}"
 
-read -p "TP (默认 2): " TP
-TP="${TP:-2}"
+read -p "TP (默认 8): " TP
+TP="${TP:-8}"
 
-read -p "DP (默认 4): " DP
-DP="${DP:-4}"
+read -p "MAX_MODEL_LEN (默认 131072): " MAX_MODEL_LEN
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 
 TOK_CFG="${MODEL_PATH}/tokenizer_config.json"
 if [ -f "${TOK_CFG}" ]; then
@@ -37,13 +37,15 @@ echo "Starting vLLM server..."
 echo "  Model:  ${MODEL_PATH}"
 echo "  Port:   ${PORT}"
 echo "  TP:     ${TP}"
-echo "  DP:     ${DP}"
+echo "  MaxLen: ${MAX_MODEL_LEN}"
 echo "  GPUs:   ${CUDA_VISIBLE_DEVICES:-all}"
 
 vllm serve "${MODEL_PATH}" \
-    --served-model-name "Qwen3-14B" \
+    --served-model-name "Qwen3-235B-A22B" \
+    --enable-expert-parallel \
     --tensor-parallel-size "${TP}" \
-    --data-parallel-size "${DP}" \
     --port "${PORT}" \
+    --max-model-len "${MAX_MODEL_LEN}" \
+    --trust-remote-code \
     --enable-auto-tool-choice \
     --tool-call-parser hermes

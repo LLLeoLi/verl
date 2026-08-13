@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/EnvScaler-Qwen3-8B): " MODEL_PATH
-MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/EnvScaler-Qwen3-8B}"
+read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/baselines/EnvScaler-Qwen3-8B): " MODEL_PATH
+MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/baselines/EnvScaler-Qwen3-8B}"
 
 read -p "PORT (默认 8025): " PORT
 PORT="${PORT:-8025}"

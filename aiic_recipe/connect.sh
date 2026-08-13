@@ -60,6 +60,10 @@ Host ST_agent_03
   ProxyCommand ssh -W %h:%p dev
   User root
   Port 8022
+
+Host aliyun
+  HostName 47.93.117.41
+  User root
 EOF
 
 chmod 600 "$CONFIG_PATH"
@@ -81,8 +85,9 @@ echo "=========================================="
 echo "请选择要连接的目标机器："
 echo "  0) HKUST-NLP (jxcpu1.cse.ust.hk)"
 echo "  1) dev (JD 开发机)"
+echo "  2) aliyun (47.93.117.41)"
 echo "=========================================="
-read -p "请输入选项 [0/1] (默认 0): " MACHINE_CHOICE
+read -p "请输入选项 [0/1/2] (默认 0): " MACHINE_CHOICE
 MACHINE_CHOICE=${MACHINE_CHOICE:-0}
 
 case "$MACHINE_CHOICE" in
@@ -93,6 +98,11 @@ case "$MACHINE_CHOICE" in
         ;;
     1)
         TARGET_HOST="dev"
+        DEFAULT_REMOTE_PORT=18025
+        DEFAULT_LOCAL_PORT=8025
+        ;;
+    2)
+        TARGET_HOST="aliyun"
         DEFAULT_REMOTE_PORT=18025
         DEFAULT_LOCAL_PORT=8025
         ;;

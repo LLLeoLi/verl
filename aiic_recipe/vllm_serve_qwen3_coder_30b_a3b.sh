@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/Qwen3-Coder-30B-A3B-Instruct-noptc/v0-20260801-064535/checkpoint-106): " MODEL_PATH
-MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/Qwen3-Coder-30B-A3B-Instruct-noptc/v0-20260801-064535/checkpoint-106}"
+read -p "MODEL_PATH (默认 /mnt/public_02/lihao/ptc-checkpoints/0804-gspo-tp4-pp1-cp2-ep8-etp1-total_epochs10-group_size16-reward_typebinary-qwen3-coder-ptc-only/global_step_150/actor/huggingface): " MODEL_PATH
+MODEL_PATH="${MODEL_PATH:-/mnt/public_02/lihao/ptc-checkpoints/0804-gspo-tp4-pp1-cp2-ep8-etp1-total_epochs10-group_size16-reward_typebinary-qwen3-coder-ptc-only/global_step_150/actor/huggingface}"
 
 read -p "PORT (默认 8025): " PORT
 PORT="${PORT:-8025}"
